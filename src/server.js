@@ -10,7 +10,8 @@ import { isAllowed, listAllowed } from './whitelist.js';
 import { resolveAlias, listAliases } from './aliases.js';
 
 // How long /chats/:id/messages waits for the extension to confirm a queued send
-// before returning "still pending". The extension polls /outbound every ~2s.
+// before returning "still pending". With SSE push the tab usually confirms in
+// 1-2s even in the background.
 const SEND_WAIT_MS = 8000;
 const SEND_POLL_MS = 250;
 
@@ -40,7 +41,10 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
   app.use((req, res, next) => {
     if (req.path === '/health') return next();
     const auth = req.get('authorization') ?? '';
-    const [, token] = auth.split(' ');
+    const [, headerToken] = auth.split(' ');
+    // EventSource (SSE) can't set custom headers, so the stream endpoint accepts
+    // the token as a query param instead. Loopback-only, so this is acceptable.
+    const token = headerToken || (req.path === '/outbound/stream' ? req.query.token : undefined);
     if (token !== apiToken) return res.status(401).json({ error: 'unauthorized' });
     next();
   });
@@ -155,6 +159,31 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
   });
 
   // ── Outbound queue (extension mode): extension drains pending sends ─────────
+  // SSE push is the primary path: a background browser tab throttles its timers
+  // (so polling stalls), but it still reacts to network/SSE events immediately.
+  // /outbound (polling) stays as a backstop. A single active tab is assumed, so
+  // we push each send to one client to avoid double-sending.
+  const sseClients = new Set();
+  function writeSends(res, sends) {
+    if (sends.length) res.write(`data: ${JSON.stringify({ sends })}\n\n`);
+  }
+  function pushSends(sends) {
+    const [client] = sseClients;
+    if (client) writeSends(client, sends);
+  }
+
+  app.get('/outbound/stream', (req, res) => {
+    res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+    res.flushHeaders?.();
+    res.write(': connected\n\n');
+    sseClients.add(res);
+    // Catch-up: deliver anything queued while no client was connected, or since
+    // a reconnect.
+    writeSends(res, claimPending({ limit: 100 }));
+    const heartbeat = setInterval(() => res.write(': ping\n\n'), 25000);
+    req.on('close', () => { clearInterval(heartbeat); sseClients.delete(res); });
+  });
+
   app.get('/outbound', (req, res) => {
     const limit = Math.min(parseInt(req.query.limit ?? '20', 10), 100);
     res.json({ sends: claimPending({ limit }) });
@@ -190,8 +219,10 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
       }
     }
 
-    // extension mode: enqueue and wait briefly for the browser to send it
+    // extension mode: enqueue, push to the connected tab via SSE, then wait
+    // briefly for it to confirm.
     const id = enqueueSend({ chatId: req.params.id, text });
+    if (sseClients.size) pushSends(claimPending({ limit: 50 }));
     const deadline = Date.now() + SEND_WAIT_MS;
     while (Date.now() < deadline) {
       await sleep(SEND_POLL_MS);
