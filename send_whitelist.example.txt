@@ -1,0 +1,14 @@
+# WhatsApp send whitelist
+# Only chats listed here can receive messages when ENABLE_SEND=true.
+# Copy this file to `send_whitelist.txt` and add your own entries.
+#
+# Accepted formats (one per line):
+#   - Phone number (digits only):       5511999999999
+#   - Full DM JID:                      5511999999999@s.whatsapp.net
+#   - Full group JID:                   120363xxxxxxxxxxxx@g.us
+#
+# Lines starting with `#` are comments. Inline `# ...` after an entry is also allowed.
+# The service watches this file and reloads on save — no restart needed.
+
+# 5511999999999                   # João - lead dev
+# 120363xxxxxxxxxxxx@g.us         # Grupo Vendas

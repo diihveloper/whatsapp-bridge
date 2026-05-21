@@ -1,0 +1,51 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+- `npm install` — install deps (Node ≥ 20; `better-sqlite3` ships prebuilt Windows binaries, no MSVC needed).
+- `npm start` — run the bridge in foreground. Holds the terminal; open another shell for other commands.
+- `npm run dev` — same as start, with `node --watch` auto-reload.
+- `npm run install-skill` — copies `skill/whatsapp-read/` into `~/.claude/skills/whatsapp-read/`. Must restart Claude Code afterwards to pick it up.
+- `npm run wl` — interactive whitelist editor (reads `data/messages.db` directly, doesn't need the service running).
+
+No test suite, linter, or build step. The repo is plain ESM (`"type": "module"`) — no transpile.
+
+## Architecture
+
+Three persistence locations, each with a different role:
+
+- `~/.whatsapp-bridge/config.json` (chmod 600) — `apiToken` and `baseUrl`. Generated on first `npm start` by `src/config.js`. The skill reads this same file to learn how to call back.
+- `./auth_data/` — Baileys multi-file auth state (Signal Protocol keys). Delete to force re-pairing via QR.
+- `./data/messages.db` — SQLite (WAL mode) with `chats`, `messages`, `contacts`, and an FTS5 virtual table `messages_fts` kept in sync via triggers. Schema is created on first run in `src/store.js`. The `contacts` table is the name → JID resolver, populated from `pushName` (per-message, sender side), `contacts.update.notify` (address-book name), and `contacts.update.name` (verified business name). `chats.name` is only for *chat* names — group titles or DM display names — and is intentionally not used as a person lookup.
+
+Process flow (`src/index.js` wires it up):
+
+1. `loadOrCreateConfig()` generates/reads the API token.
+2. `startWhatsApp()` (`src/whatsapp.js`) opens a Baileys socket, prints QR if unauthenticated, and subscribes to `messages.upsert` / `contacts.update` / `chats.upsert`. Inbound messages are normalized by `extractBody()` (handles text / image caption / video caption / audio / document / sticker / reaction) and written through `saveMessage()`.
+3. `createServer()` (`src/server.js`) mounts the Express API on `HOST:PORT` (defaults `127.0.0.1:4477`). All routes except `/health` require `Authorization: Bearer <apiToken>`.
+
+**Two connection backends, selected by `BRIDGE_MODE` (`src/index.js`):**
+
+- `baileys` (default) — step 2 above. The socket lives in the service, so `POST /chats/:id/messages` calls `sendText()` directly.
+- `extension` — Baileys is **not** started. The WhatsApp connection lives in a Chrome/Chromium tab via the MV3 extension in `./extension`, which uses `@wppconnect/wa-js` against the official WhatsApp Web client (no new linked device → far lower ban risk than Baileys). The extension pushes normalized messages/contacts to `POST /ingest` and the service can't send directly — `POST /chats/:id/messages` instead **enqueues** into the `outbound` SQLite table (whitelist + `ENABLE_SEND` checks unchanged, still the server-side security boundary), then waits up to 8s for the tab to confirm before returning `200` or `202 {pending}`. The extension drains the queue via `GET /outbound` (which atomically marks rows `sending`) and reports back via `POST /outbound/:id/result`. CORS is allowed only for `chrome-extension://` origins; the Bearer token is still the real auth. The extension's two content scripts run in different worlds (`inject.js` MAIN = `window.WPP`, `bridge.js` ISOLATED = HTTP) and talk via `window.postMessage`. JID normalization happens in `inject.js`: WhatsApp Web's `@c.us` ↔ the DB's `@s.whatsapp.net`. `npm run build-extension` vendors the wa-js bundle from `node_modules` into `extension/vendor/` (gitignored).
+
+**Send path is opt-in twice over**: `ENABLE_SEND=true` env *and* the target chat present in `send_whitelist.txt` (root). `src/whitelist.js` loads the file once, normalizes phone-number entries to `<digits>@s.whatsapp.net`, and `fs.watch`es the directory to reload (debounced 100ms) on save — no restart needed. Empty/missing file means *no chats can be sent to*; this is intentional, never weaken it. `scripts/whitelist.js` is the interactive picker that mutates this same file while preserving manual entries and comments.
+
+**Contact name resolution**: `src/aliases.js` mirrors the whitelist pattern (`contacts_aliases.txt` in root, watched, `alias = jid` format, comments with `#`). The `/contacts?q=` endpoint in `src/server.js` first checks the alias map, then falls back to substring search on the `contacts` table. Alias matches are tagged `matchedVia: "alias"` so the skill can treat them as explicit user intent. The whitelist is a *security* boundary (must be edited by the user); aliases are a *convenience* layer (also user-owned, but not a security control).
+
+The skill (`skill/whatsapp-read/SKILL.md`) is a documentation-only contract — it tells future Claude sessions how to call the HTTP API, but is decoupled from server code. If you change endpoints, update the skill's endpoint table.
+
+## Conventions
+
+- Chat IDs are JIDs: `<digits>@s.whatsapp.net` (DM, traditional), `<digits>@lid` (DM, modern Linked-ID system — same person, anonymized identifier), or `<digits>@g.us` (group). The `is_group` flag in the DB is derived purely from the `@g.us` suffix.
+- `pushName` is the *sender's* display name, never the chat's. In `messages.upsert`, only DMs use `pushName` as the chat name; for groups it would overwrite the real group title (this was a historical bug — don't reintroduce it). Group names come from `chats.upsert` events.
+- Timestamps in the DB are Unix **milliseconds** (Baileys gives seconds; `whatsapp.js` multiplies by 1000 before storing).
+- `getMessages()` queries DESC then `.reverse()`s in JS so each page returns oldest→newest while still respecting `LIMIT`. Don't "simplify" this to `ORDER BY ASC`.
+- `INSERT OR IGNORE` on `messages.id` is the dedup mechanism for re-delivered messages — duplicates from Baileys are expected, not a bug.
+- The auth middleware uses naive `split(' ')` on the Authorization header; don't change to a constant-time compare without also reconsidering the threat model (loopback-only by default, see README "Notas de segurança").
+
+## Files never to commit
+
+`.gitignore` already excludes `auth_data/`, `data/`, `node_modules/`, `.env`, `send_whitelist.txt`, and `contacts_aliases.txt`. The API token in `~/.whatsapp-bridge/config.json` lives outside the repo entirely.

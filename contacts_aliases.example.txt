@@ -1,0 +1,21 @@
+# Apelidos de contatos para resolver nomes informais → JID.
+#
+# Use esse arquivo quando o nome que você usa pra um contato não bate
+# com o que aparece no WhatsApp (pushName / nome salvo na agenda).
+# Útil pra apelidos ("patrão", "tia") ou para desambiguar dois contatos
+# com o mesmo pushName ("Diego trabalho" vs "Diego primo").
+#
+# Formato: <alias> = <jid>
+# - alias é case-insensitive, pode ter espaços
+# - jid é o identificador do WhatsApp (DM: 5511...@s.whatsapp.net ou ...@lid;
+#   grupo: 120363...@g.us)
+# - linhas começando com # são comentários; comentário inline também vale
+#
+# Esse arquivo recarrega automaticamente quando você salva — sem restart.
+#
+# Exemplos:
+# fulano        = 5511999999999@s.whatsapp.net
+# patrão        = 5521988887777@s.whatsapp.net
+# diego trabalho = 182875546767514@lid
+# diego primo    = 12214920589543@lid
+# grupo entrega  = 120363421536893000@g.us   # apelido pode apontar pra grupo também

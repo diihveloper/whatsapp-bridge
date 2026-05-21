@@ -1,0 +1,29 @@
+{
+  "name": "whatsapp-bridge",
+  "version": "0.1.0",
+  "description": "Local WhatsApp service + Claude Code skill for reading messages",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "install-skill": "node scripts/install-skill.js",
+    "wl": "node scripts/whitelist.js",
+    "build-extension": "node scripts/build-extension.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^7.2.0",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "pino": "^9.4.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@wppconnect/wa-js": "^3.16.0"
+  }
+}
