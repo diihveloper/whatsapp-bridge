@@ -7,10 +7,10 @@ import { listAllowed, whitelistPath } from './whitelist.js';
 const PORT = Number(process.env.PORT ?? 4477);
 const HOST = process.env.HOST ?? '127.0.0.1';
 const sendEnabled = process.env.ENABLE_SEND === 'true';
-// 'baileys' = built-in socket (default, may trip Meta's anti-abuse heuristics).
-// 'extension' = the WhatsApp connection lives in a browser tab via the Chrome
-// extension, which feeds /ingest and drains /outbound; no Baileys device here.
-const mode = process.env.BRIDGE_MODE === 'extension' ? 'extension' : 'baileys';
+// 'extension' (default) = the WhatsApp connection lives in a browser tab via the
+// Chrome extension, which feeds /ingest and drains /outbound; no Baileys device
+// (lower ban risk). 'baileys' = built-in socket; opt in explicitly.
+const mode = process.env.BRIDGE_MODE === 'baileys' ? 'baileys' : 'extension';
 
 const config = loadOrCreateConfig();
 writeRuntimeInfo({ baseUrl: `http://${HOST}:${PORT}`, sendEnabled });

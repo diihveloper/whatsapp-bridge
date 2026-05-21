@@ -1,44 +1,100 @@
 # whatsapp-bridge
 
-Serviço local que mantém uma sessão do WhatsApp Web autenticada e expõe uma API HTTP enxuta. Acompanha uma skill do Claude Code (`whatsapp-read`) que permite ao Claude ler suas mensagens sob demanda.
+Programa que roda **no seu próprio computador**, fica conectado ao seu WhatsApp e guarda as mensagens num banco de dados local. Vem junto com uma skill do Claude Code (`whatsapp-read`) que deixa o Claude **ler, buscar e (se você liberar) enviar** mensagens pra você — por exemplo: "me faz um resumo do que rolou no grupo hoje".
 
-Construído sobre [Baileys](https://github.com/WhiskeySockets/Baileys). **Não oficial** — vale os mesmos trade-offs de qualquer automação do WhatsApp Web (use uma conta não crítica, risco baixo mas existente de banimento, o protocolo pode mudar e exigir `npm update`).
+Nada é enviado para servidor externo: token, mensagens e sessão ficam todos na sua máquina.
 
-## O que você ganha
+## Escolha o modo de conexão
 
-- Serviço Node que conecta no WhatsApp Web, persiste mensagens em SQLite e expõe tudo em `http://127.0.0.1:4477` com token Bearer.
-- Skill do Claude Code que ensina o Claude a consultar esse serviço. Dispara sempre que o usuário pergunta algo sobre WhatsApp.
-- Somente leitura por padrão. Envio só funciona se `ENABLE_SEND=true`.
+Existem dois jeitos de conectar no WhatsApp. Você escolhe **um**:
 
-## Pré-requisitos
+| Modo | Como conecta | Prós e contras |
+|------|--------------|----------------|
+| **`extension`** *(recomendado)* | Usa a sua sessão **oficial** do WhatsApp Web, numa aba do Chrome, com uma extensão que repassa as mensagens. **Não cria aparelho conectado novo.** | ✅ Risco bem menor de banimento. ⚠️ Precisa manter uma aba do navegador aberta. |
+| **`baileys`** | Um cliente embutido que conecta direto no WhatsApp (via [Baileys](https://github.com/WhiskeySockets/Baileys)). | ✅ Roda sozinho, sem navegador. ⚠️ É **não oficial** — risco maior de a Meta sinalizar/banir a conta. |
 
-- Node.js 20 ou mais novo.
-- Windows / macOS / Linux. No Windows, o `better-sqlite3` já vem com binários compilados — sem necessidade do MSVC toolchain.
+> Na dúvida, use o **modo extensão**. Em qualquer caso, prefira testar com uma conta de WhatsApp que não seja crítica.
 
-## Instalação
+## Instalação (vale para os dois modos)
+
+> **Pré-requisito:** [Node.js](https://nodejs.org) versão 20 ou mais nova. No Windows não precisa instalar mais nada — o banco de dados já vem pronto.
+
+Abra um terminal **na pasta do projeto** (a pasta onde você baixou estes arquivos) e rode, nesta ordem:
 
 ```bash
-# 1. instalar dependências
-npm install
+npm install            # baixa as dependências do projeto
+npm run install-skill  # instala a skill do Claude Code
+```
 
-# 2. opcional: copiar .env.example pra .env e ajustar
-cp .env.example .env
+Agora crie o arquivo de configuração `.env`. Ele é só um arquivo de texto, com uma opção por linha (`CHAVE=valor`). Copie o modelo pronto:
 
-# 3. instalar a skill do Claude Code (copia skill/ pra ~/.claude/skills/)
-npm run install-skill
+```bash
+cp .env.example .env                 # no Windows (PowerShell): Copy-Item .env.example .env
+```
 
-# 4. subir o serviço (fica em foreground)
+No próximo passo você abre esse `.env` num editor de texto e ajusta conforme o modo escolhido.
+
+> 💡 O serviço cria um **token de acesso** automaticamente na primeira vez que sobe, e o guarda em `~/.whatsapp-bridge/config.json`. O `~` é a sua pasta de usuário (no Windows, `C:\Users\seu-usuario`). As mensagens ficam dentro do projeto, em `data/messages.db`.
+
+## Como rodar — modo extensão (recomendado)
+
+**1. Gere a extensão** (isso copia o "leitor" do WhatsApp Web para dentro dela):
+
+```bash
+npm run build-extension
+```
+
+**2. Edite o `.env`** num editor de texto e deixe estas duas linhas assim:
+
+```
+BRIDGE_MODE=extension
+ENABLE_SEND=true
+```
+
+> Deixe `ENABLE_SEND=false` se você quer que o Claude **só leia** suas mensagens, sem poder enviar nada.
+
+**3. Suba o serviço:**
+
+```bash
 npm start
 ```
 
-Faça o `install-skill` antes do `start` — `npm start` segura o terminal, então depois disso só dá pra rodar outros comandos parando o serviço ou abrindo outra aba.
+Deixe esse terminal aberto — é nele que o serviço fica rodando. (Para parar, aperte `Ctrl+C`.)
 
-Na primeira execução do `npm start`, o serviço:
-1. Gera um token de API e grava em `~/.whatsapp-bridge/config.json` (chmod 600).
-2. Imprime um QR code no terminal — escaneie no celular: **Configurações → Aparelhos conectados → Conectar um aparelho**.
-3. Começa a escutar em `127.0.0.1:4477`.
+**4. Carregue a extensão no navegador:**
 
-O estado de autenticação fica persistido em `./auth_data/`, então o QR só precisa ser escaneado uma vez. As mensagens ficam em `./data/messages.db`.
+- Abra `chrome://extensions` no Chrome/Chromium
+- Ligue o **Modo do desenvolvedor** (interruptor no canto superior direito)
+- Clique em **Carregar sem compactação** e selecione a pasta `extension` que está dentro do projeto
+
+**5. Cole o token na extensão:**
+
+- Na extensão que acabou de aparecer, clique em **Detalhes → Opções da extensão**
+- Abra o arquivo `~/.whatsapp-bridge/config.json`, copie o valor que está em `apiToken` e cole no campo. Clique em **Save**.
+
+**6. Abra o WhatsApp Web:**
+
+- Acesse [`https://web.whatsapp.com`](https://web.whatsapp.com) e faça login (mesma conta do celular)
+- **Mantenha essa aba aberta** — é por ela que as mensagens chegam ao serviço
+- Para confirmar que deu certo: aperte `F12`, vá na aba **Console** e procure a linha `[wab] connected to WPP, streaming messages to the bridge`
+
+Pronto! Agora é só pedir ao Claude (veja ["Usando a skill"](#usando-a-skill)). Detalhes técnicos da extensão em [`extension/README.md`](extension/README.md).
+
+## Como rodar — modo Baileys
+
+**1. Edite o `.env`** e deixe:
+
+```
+BRIDGE_MODE=baileys
+```
+
+**2. Suba o serviço:**
+
+```bash
+npm start
+```
+
+Na primeira vez, o terminal mostra um **QR code**. No celular: **WhatsApp → Configurações → Aparelhos conectados → Conectar um aparelho** e escaneie o código. O login fica salvo em `auth_data/`, então o QR só aparece uma vez. Deixe o terminal aberto enquanto quiser usar o serviço.
 
 ## Usando a skill
 
@@ -52,39 +108,34 @@ Se você instalou a skill com o Claude Code já aberto, feche e reabra pra ele d
 
 ## Configuração
 
-Variáveis de ambiente (no `.env` ou no shell):
+Todas as opções ficam no arquivo `.env`, uma por linha no formato `CHAVE=valor`. Exemplo de um `.env` de modo extensão com envio liberado:
+
+```
+BRIDGE_MODE=extension
+ENABLE_SEND=true
+PORT=4477
+HOST=127.0.0.1
+```
+
+Opções disponíveis:
 
 | Variável            | Padrão        | Função                                                       |
 |---------------------|---------------|--------------------------------------------------------------|
 | `PORT`              | `4477`        | Porta HTTP                                                   |
 | `HOST`              | `127.0.0.1`   | Endereço de bind. Mantenha em loopback a menos que precise expor pra LAN. |
-| `BRIDGE_MODE`       | `baileys`     | `baileys` (socket embutido) ou `extension` (conexão vive numa aba do Chrome via extensão — ver abaixo). |
+| `BRIDGE_MODE`       | `extension`   | Como conectar: `extension` (padrão) ou `baileys`. Veja as seções "Como rodar" acima. |
 | `ENABLE_SEND`       | `false`       | Defina `true` pra liberar `POST /chats/:id/messages`.        |
 | `BAILEYS_LOG_LEVEL` | `warn`        | Verbosidade interna do Baileys. Suba pra `info`/`debug` só quando estiver investigando problema na conexão WA. |
 
-## Modo extensão (menor risco de banimento)
+## Mantendo a extensão atualizada
 
-O modo `baileys` registra um **aparelho conectado** reimplementando o protocolo — é o que pode levantar flag na Meta. O modo `extension` evita isso: a conexão com o WhatsApp continua sendo a sua sessão **oficial** do WhatsApp Web, aberta numa aba do Chrome/Chromium, e uma extensão observa as mensagens e alimenta este serviço. Nenhum aparelho novo é criado.
-
-Trade-off: precisa de uma aba do WhatsApp Web **aberta** pra funcionar — não roda 24/7 headless como o Baileys.
-
-### Setup
+De vez em quando o WhatsApp Web muda por dentro e a captura pode parar de funcionar. Quando isso acontecer, atualize o leitor e gere a extensão de novo:
 
 ```bash
-# 1. baixar/atualizar o bundle do wa-js para dentro da extensão
-npm run build-extension
-
-# 2. subir o serviço em modo extensão
-BRIDGE_MODE=extension ENABLE_SEND=true npm start   # PowerShell: $env:BRIDGE_MODE='extension'; ...
+npm update @wppconnect/wa-js && npm run build-extension
 ```
 
-3. No Chrome/Chromium: `chrome://extensions` → ativar **Modo do desenvolvedor** → **Carregar sem compactação** → selecionar a pasta `extension/`.
-4. Clicar em **Detalhes → Opções da extensão** e colar o `apiToken` de `~/.whatsapp-bridge/config.json` (e a URL do serviço, se mudou a porta).
-5. Abrir/recarregar `https://web.whatsapp.com` (logado). O console da aba mostra `[wab] connected to WPP, streaming messages to the bridge`.
-
-A partir daí as mensagens novas caem no `data/messages.db` e os envios enfileirados pelo `POST /chats/:id/messages` são executados pela aba. Detalhes em [`extension/README.md`](extension/README.md).
-
-Depois de uma atualização do WhatsApp Web que quebre a captura, rode `npm update @wppconnect/wa-js && npm run build-extension` e recarregue a extensão.
+Depois, em `chrome://extensions`, clique no ícone de recarregar (↻) da extensão e atualize a aba do WhatsApp Web.
 
 ## Whitelist de envio
 
@@ -168,13 +219,17 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:4477/health
 
 **A skill não dispara** — Verifique se você rodou `npm run install-skill` e abriu uma sessão nova do Claude Code. Confirme que o arquivo `~/.claude/skills/whatsapp-read/SKILL.md` está lá.
 
+**(Modo extensão) As mensagens não aparecem / o Claude diz que não tem nada novo** — A aba do `web.whatsapp.com` precisa estar **aberta**. Confirme no console da aba (`F12` → Console) a linha `[wab] connected to WPP, streaming...`. Lembre que o serviço só captura mensagens recebidas **enquanto** estava rodando — ele não importa o histórico antigo.
+
+**(Modo extensão) `Failed to fetch` no console da aba** — O serviço não está no ar ou está em outra porta. Confirme que o `npm start` está rodando e que a URL nas opções da extensão bate com a do serviço.
+
 ## Compartilhando com o time
 
 O repo está estruturado pra ser clonado direto. Cada pessoa:
-1. Clona o repo.
-2. Roda `npm install`.
-3. Roda `npm run install-skill`.
-4. Roda `npm start` e escaneia o QR com o próprio WhatsApp.
+1. Clona o repo e roda `npm install`.
+2. Roda `npm run install-skill`.
+3. Cria o `.env` (`cp .env.example .env`) e escolhe o modo (veja "Como rodar").
+4. Sobe com `npm start` e conecta o próprio WhatsApp (extensão + token, ou QR no modo Baileys).
 
 Cada pessoa tem sessão, token e banco de mensagens próprios, locais — sem estado compartilhado.
 
