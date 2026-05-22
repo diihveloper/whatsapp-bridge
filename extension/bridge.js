@@ -152,7 +152,13 @@
     // EventSource can't set an Authorization header, so the token rides in the
     // query string (loopback only).
     es = new EventSource(`${cfg.baseUrl}/outbound/stream?token=${encodeURIComponent(cfg.token)}`);
-    es.onopen = () => console.log('[wab] outbound stream connected');
+    es.onopen = () => {
+      console.log('[wab] outbound stream connected');
+      // The server keeps connection state in memory, so a server restart (which
+      // drops and re-opens this stream) loses it. Ask inject.js to re-report the
+      // current state so /health doesn't go stale while ingest keeps working.
+      window.postMessage({ [TAG]: true, kind: 'requestStatus' }, '*');
+    };
     es.onmessage = (ev) => {
       try {
         const d = JSON.parse(ev.data);

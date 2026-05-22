@@ -180,6 +180,14 @@
     post({ kind: 'status', state });
   }
 
+  // Re-report the live connection state on demand (bridge.js asks for this when
+  // its SSE stream reconnects, e.g. after a server restart). Only once we've
+  // started — otherwise start() will emit the real state shortly anyway.
+  function reportCurrentStatus() {
+    if (!window.__wabStarted || !window.WPP) return;
+    emitStatus(window.WPP.conn?.isMainReady ? 'connected' : 'needs_auth');
+  }
+
   async function handleSendCommand({ id, chatId, text }) {
     try {
       const result = await window.WPP.chat.sendTextMessage(toWaJid(chatId), text, { createChat: true });
@@ -263,6 +271,7 @@
     if (!d || d[TAG] !== true) return;
     if (d.kind === 'sendCommand') handleSendCommand(d);
     else if (d.kind === 'backfillCommand') handleBackfill(d);
+    else if (d.kind === 'requestStatus') reportCurrentStatus();
   });
 
   function start() {
