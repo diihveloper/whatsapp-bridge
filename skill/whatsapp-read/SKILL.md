@@ -23,10 +23,10 @@ If the file does not exist or the request to `/health` fails with `ECONNREFUSED`
 GET {baseUrl}/health
 ```
 
-Response: `{ ok, mode, connected, hasQR, sendEnabled, messages, chats }`.
+Response: `{ ok, mode, connected, hasQR, sendEnabled, messages, chats }` (extension mode also includes `extension: { state, at }`).
 
 - **`mode: "baileys"`** (default): if `connected: false` and `hasQR: true`, tell the user to look at the service terminal and scan the QR code. Do not retry queries until connected.
-- **`mode: "extension"`**: the WhatsApp connection lives in a Chrome/Chromium tab (the bridge extension), not in the service — so `connected` is always `false` and there is no QR here. Ingestion only happens while a WhatsApp Web tab is open. If reads look stale or empty, the likely cause is that the tab is closed; tell the user to open WhatsApp Web with the extension installed.
+- **`mode: "extension"`**: the WhatsApp connection lives in a Chrome/Chromium tab (the bridge extension), not in the service. The tab reports its state, so `connected` here means the tab is live and `extension.state` is one of `connected` / `needs_auth` (QR/login screen) / `logged_out` / `unknown` (no tab has reported yet). If `connected: false` or reads look stale, tell the user to open/refresh WhatsApp Web with the extension installed — and if `needs_auth`/`logged_out`, that they need to scan the QR / log back in.
 
 ## Available endpoints
 
@@ -38,6 +38,7 @@ All under `{baseUrl}`. All require the Bearer token except `/health`.
 | GET    | `/chats/:id/messages?limit=50&since=<ms>` | Messages in a chat (oldest→newest)   |
 | GET    | `/search?q=<text>&limit=20`   | Full-text search across all messages |
 | POST   | `/chats/:id/read`             | Mark chat as read                    |
+| POST   | `/chats/:id/backfill`         | (extension mode) re-fetch chat history into the DB. Body `{ since?: ms, max?: N }` |
 | GET    | `/contacts?q=<text>&limit=20` | Resolve a name/alias → contact JID(s) |
 | GET    | `/contacts/aliases`           | List manual aliases from `contacts_aliases.txt` |
 | GET    | `/send/whitelist`             | Allowed chats for sending (read-only) |
@@ -76,6 +77,21 @@ If the user asks to send a WhatsApp message:
 
 In `mode: "extension"`, the send is enqueued and executed by the browser tab. The response is `200 {ok:true}` once the tab confirms, or `202 {pending:true}` if the WhatsApp Web tab didn't confirm within a few seconds — in that case tell the user to make sure the WhatsApp Web tab (with the extension) is open; the message is queued and will go out when the tab is back.
 
+## Backfilling history before a summary (extension mode only)
+
+The service only stores messages it observed live. If the WhatsApp Web tab or the service were closed for a while, those messages are a gap in `data/messages.db`. Before summarizing or reading a full conversation, consider backfilling:
+
+```
+POST {baseUrl}/chats/<jid>/backfill   body: {"since": <ms>}   # since optional; omit/0 = as far back as possible (capped)
+```
+
+- The browser tab re-fetches the chat's history from WhatsApp Web's local store and re-ingests it (duplicates are ignored). Then read `/chats/:id/messages` as usual.
+- Response: `200 {ingested: N}` once done, or `202 {pending: true}` if it's still running — in that case wait a couple seconds and read the messages anyway.
+- `503 no WhatsApp Web tab connected` means no tab is open — tell the user to open WhatsApp Web with the extension; backfill needs the live tab.
+- **Limits:** only history WhatsApp Web has itself synced from the phone is recoverable (a recent window, not the entire chat lifetime); media isn't downloaded; and a message edited/deleted during downtime comes back in its current state. The service also auto-backfills unread chats whenever the tab reconnects, so the gap often fills on its own.
+
+When the user asks for a summary of a conversation and reads look thin or there's a known downtime, backfill first (`since` = roughly when the gap started, in ms), then read and summarize.
+
 ## How to call (Bash on Git Bash / WSL / macOS / Linux)
 
 ```bash
@@ -98,4 +114,5 @@ Invoke-RestMethod -Uri "$($cfg.baseUrl)/chats?limit=10" -Headers @{ Authorizatio
 - Timestamps come as Unix ms. Convert to the user's local time when displaying.
 - For chat listings, show name (or ID if name is missing), unread count, and time of last message.
 - For message listings, show `sender (or "me") — time — body`. Trim long bodies to ~200 chars unless asked for full content.
+- Messages can carry `deletedAt` and `editedAt`/`originalBody`. When `deletedAt` is set the message was deleted for everyone but the original `body` is preserved — flag it, e.g. "(apagada pelo remetente)". When `editedAt` is set, `body` is the latest text and `originalBody` (if present) is what was sent first — mention it was edited and show the original if relevant. A message with `type: "reaction"` is someone reacting with the emoji in `body` (empty body = the reaction was removed).
 - Group chat senders include the participant JID; render the part before `@` unless a name is available.

@@ -20,7 +20,7 @@
   let readyLogged = false;
   let es = null;
   let flushScheduled = false;
-  const ingestBuffer = { messages: [], contacts: [] };
+  const ingestBuffer = { messages: [], contacts: [], revokes: [], edits: [], chatNames: [] };
 
   function loadConfig() {
     return new Promise((resolve) => {
@@ -57,12 +57,35 @@
       if (d.message) ingestBuffer.messages.push(d.message);
       if (d.contact) ingestBuffer.contacts.push(d.contact);
       scheduleFlush(); // event-driven, so it works even in a background tab
+    } else if (d.kind === 'revoke') {
+      if (d.id) ingestBuffer.revokes.push(d.id);
+      scheduleFlush();
+    } else if (d.kind === 'edit') {
+      if (d.id) ingestBuffer.edits.push({ id: d.id, body: d.body, timestamp: d.timestamp });
+      scheduleFlush();
+    } else if (d.kind === 'chatMeta') {
+      if (Array.isArray(d.chatNames)) ingestBuffer.chatNames.push(...d.chatNames);
+      scheduleFlush();
+    } else if (d.kind === 'status') {
+      reportStatus(d.state);
     } else if (d.kind === 'sendResult') {
       reportResult(d);
+    } else if (d.kind === 'backfillResult') {
+      reportBackfill(d);
     } else if (d.kind === 'ready') {
       if (!readyLogged) { console.log('[wab] inject ready'); readyLogged = true; }
     }
   });
+
+  // Connection state is small and time-sensitive — send it straight through
+  // rather than batching it with ingest.
+  async function reportStatus(state) {
+    try {
+      await api('/status', { method: 'POST', body: { state } });
+    } catch (e) {
+      // bridge offline; the next state change (or tab reload) will re-report
+    }
+  }
 
   // Flush on a microtask rather than a timer: microtasks aren't throttled in
   // background tabs, and this still batches everything buffered in one task.
@@ -72,19 +95,31 @@
     Promise.resolve().then(() => { flushScheduled = false; flush(); });
   }
 
+  function buffered() {
+    return ingestBuffer.messages.length || ingestBuffer.contacts.length
+      || ingestBuffer.revokes.length || ingestBuffer.edits.length
+      || ingestBuffer.chatNames.length;
+  }
+
   async function flush() {
-    if (!ingestBuffer.messages.length && !ingestBuffer.contacts.length) return;
+    if (!buffered()) return;
     const batch = {
       messages: ingestBuffer.messages.splice(0, MAX_BATCH),
       contacts: ingestBuffer.contacts.splice(0, MAX_BATCH),
+      revokes: ingestBuffer.revokes.splice(0, MAX_BATCH),
+      edits: ingestBuffer.edits.splice(0, MAX_BATCH),
+      chatNames: ingestBuffer.chatNames.splice(0, MAX_BATCH),
     };
     try {
       await api('/ingest', { method: 'POST', body: batch });
-      if (ingestBuffer.messages.length || ingestBuffer.contacts.length) scheduleFlush();
+      if (buffered()) scheduleFlush();
     } catch (e) {
       // put it back to retry on the next tick / backstop
       ingestBuffer.messages.unshift(...batch.messages);
       ingestBuffer.contacts.unshift(...batch.contacts);
+      ingestBuffer.revokes.unshift(...batch.revokes);
+      ingestBuffer.edits.unshift(...batch.edits);
+      ingestBuffer.chatNames.unshift(...batch.chatNames);
       console.warn('[wab] ingest failed, will retry', e.message);
     }
   }
@@ -92,6 +127,23 @@
   // ── Outbound: SSE push (primary) + slow poll (backstop) ─────────────────────
   function dispatchSend(send) {
     window.postMessage({ [TAG]: true, kind: 'sendCommand', id: send.id, chatId: send.chatId, text: send.text }, '*');
+  }
+
+  // Backfill commands ride the same SSE stream; hand them to inject.js (MAIN
+  // world), which does the WPP.chat.getMessages paging.
+  function dispatchBackfill(cmd) {
+    window.postMessage({
+      [TAG]: true, kind: 'backfillCommand',
+      reqId: cmd.reqId, chatId: cmd.chatId, since: cmd.since, max: cmd.max,
+    }, '*');
+  }
+
+  async function reportBackfill({ reqId, ingested }) {
+    try {
+      await api(`/backfill/${reqId}/result`, { method: 'POST', body: { ingested } });
+    } catch (e) {
+      console.warn('[wab] failed to report backfill result', e.message);
+    }
   }
 
   function connectStream() {
@@ -105,6 +157,7 @@
       try {
         const d = JSON.parse(ev.data);
         if (d?.sends?.length) for (const s of d.sends) dispatchSend(s);
+        if (d?.backfills?.length) for (const b of d.backfills) dispatchBackfill(b);
       } catch (_) { /* ignore non-JSON keepalive */ }
     };
     es.onerror = () => { /* EventSource reconnects on its own; server re-sends pending on connect */ };

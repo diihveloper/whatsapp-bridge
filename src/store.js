@@ -45,6 +45,13 @@ db.exec(`
     INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.rowid, old.body);
   END;
 
+  -- Edits rewrite messages.body in place (see applyEdit), so the FTS index must
+  -- be re-synced on UPDATE too — the AI/AD triggers only cover INSERT/DELETE.
+  CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF body ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.rowid, old.body);
+    INSERT INTO messages_fts(rowid, body) VALUES (new.rowid, new.body);
+  END;
+
   CREATE TABLE IF NOT EXISTS contacts (
     jid TEXT PRIMARY KEY,
     push_name TEXT,
@@ -74,6 +81,19 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_outbound_status
     ON outbound(status, id);
 `);
+
+// Defensive migration: messages already exists in older DBs, so add the
+// anti-delete / edit-tracking columns only if they're missing.
+//  - deleted_at:    ms when a "delete for everyone" was observed (body kept).
+//  - edited_at:     ms of the last edit (NULL = never edited).
+//  - original_body: the pre-edit text, preserved on the first edit only.
+function ensureColumn(table, column, decl) {
+  const has = db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+  if (!has) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+}
+ensureColumn('messages', 'deleted_at', 'INTEGER');
+ensureColumn('messages', 'edited_at', 'INTEGER');
+ensureColumn('messages', 'original_body', 'TEXT');
 
 db.prepare(`
   INSERT OR IGNORE INTO contacts (jid, push_name, last_seen_at)
@@ -119,13 +139,48 @@ export function saveMessage(msg) {
   saveMessageTx(msg);
 }
 
+// Anti-delete: a "delete for everyone" keeps the original body and just flags
+// the row. No-op if we never stored the message (e.g. it predates this DB).
+const markDeletedStmt = db.prepare(
+  `UPDATE messages SET deleted_at = @at WHERE id = @id AND deleted_at IS NULL`
+);
+export function markDeleted(id, { at = Date.now() } = {}) {
+  if (!id) return;
+  markDeletedStmt.run({ id: String(id), at });
+}
+
+// Edit tracking: preserve the pre-edit text in original_body on the *first*
+// edit (COALESCE keeps it across later edits), overwrite body with the new
+// text, and stamp edited_at. The messages_au trigger keeps FTS in sync.
+const applyEditStmt = db.prepare(`
+  UPDATE messages
+  SET original_body = COALESCE(original_body, body),
+      body = @body,
+      edited_at = @at
+  WHERE id = @id AND body IS NOT @body
+`);
+export function applyEdit({ id, body, at = Date.now() } = {}) {
+  if (!id) return;
+  applyEditStmt.run({ id: String(id), body: body ?? '', at });
+}
+
+// Rename only: must NOT touch unread or last_message_at (a title refresh isn't
+// a read receipt and isn't new activity). COALESCE keeps the old name if a null
+// slips in. Overwrites with a real new name, so renames are picked up.
+const renameChatStmt = db.prepare(`
+  INSERT INTO chats (id, name, is_group, unread)
+  VALUES (@id, @name, @isGroup, 0)
+  ON CONFLICT(id) DO UPDATE SET
+    name = COALESCE(excluded.name, chats.name),
+    is_group = excluded.is_group
+`);
+
 export function updateChatName(chatId, name) {
-  upsertChatStmt.run({
+  if (!name) return;
+  renameChatStmt.run({
     id: chatId,
     name,
     isGroup: chatId.endsWith('@g.us') ? 1 : 0,
-    lastMessageAt: 0,
-    unread: 0,
   });
 }
 
@@ -153,7 +208,8 @@ export function getMessages(chatId, { limit = 50, since } = {}) {
   }
   params.push(limit);
   return db.prepare(`
-    SELECT id, chat_id AS chatId, sender, body, timestamp, from_me AS fromMe, type
+    SELECT id, chat_id AS chatId, sender, body, timestamp, from_me AS fromMe, type,
+           deleted_at AS deletedAt, edited_at AS editedAt, original_body AS originalBody
     FROM messages
     WHERE chat_id = ? ${sinceClause}
     ORDER BY timestamp DESC
@@ -164,7 +220,8 @@ export function getMessages(chatId, { limit = 50, since } = {}) {
 export function searchMessages(query, { limit = 20 } = {}) {
   return db.prepare(`
     SELECT m.id, m.chat_id AS chatId, c.name AS chatName, m.sender, m.body,
-           m.timestamp, m.from_me AS fromMe
+           m.timestamp, m.from_me AS fromMe,
+           m.deleted_at AS deletedAt, m.edited_at AS editedAt
     FROM messages_fts f
     JOIN messages m ON m.rowid = f.rowid
     LEFT JOIN chats c ON c.id = m.chat_id
@@ -179,6 +236,14 @@ export function stats() {
   const chat = db.prepare('SELECT COUNT(*) AS n FROM chats').get();
   const contact = db.prepare('SELECT COUNT(*) AS n FROM contacts').get();
   return { messages: msg.n, chats: chat.n, contacts: contact.n };
+}
+
+// High-water mark for auto-backfill: the newest message we've stored. The
+// extension refills everything after this on reconnect, closing the downtime
+// gap. NULL (fresh DB) → caller picks a default window.
+export function lastMessageTimestamp() {
+  const row = db.prepare('SELECT MAX(timestamp) AS ts FROM messages').get();
+  return row?.ts ?? null;
 }
 
 const upsertContactStmt = db.prepare(`
