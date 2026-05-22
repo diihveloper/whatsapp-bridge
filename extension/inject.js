@@ -31,6 +31,17 @@
     return String(jid).replace(/@s\.whatsapp\.net$/, '@c.us');
   }
 
+  // Bare phone digits, ignoring domain/device — for comparing mention targets.
+  const localDigits = (w) => String(w?._serialized ?? w?.user ?? w ?? '').split('@')[0].split(':')[0].replace(/\D/g, '');
+
+  // The account owner's number, cached so we can flag @mentions of ourselves.
+  let meDigits = '';
+  function refreshMe() {
+    try {
+      meDigits = localDigits(window.WPP.conn?.getMaybeMeUser?.());
+    } catch (_) { /* not ready yet */ }
+  }
+
   const TYPE_MAP = {
     chat: 'text',
     ptt: 'audio',
@@ -51,11 +62,27 @@
     const isGroup = chatId.endsWith('@g.us');
     const type = TYPE_MAP[msg.type] ?? msg.type ?? 'unknown';
 
-    let body = msg.body ?? msg.caption ?? '';
-    if (!body && type !== 'text') body = `[${type}]`;
+    // For media, WhatsApp Web's msg.body is often the base64 *thumbnail* (e.g.
+    // "/9j/4AA…"), not text — storing it would bloat the DB, pollute FTS search
+    // and waste tokens on every read. So for media types we only keep a real
+    // caption (or the document filename), falling back to a "[type]" placeholder.
+    const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'document', 'sticker']);
+    let body;
+    if (MEDIA_TYPES.has(type)) {
+      body = (msg.caption || '').trim();
+      if (!body && type === 'document' && msg.filename) body = String(msg.filename);
+      if (!body) body = `[${type}]`;
+    } else {
+      body = msg.body ?? msg.caption ?? '';
+      if (!body && type !== 'text') body = `[${type}]`;
+    }
 
     const sender = isGroup ? toBridgeJid(msg.author ?? msg.sender) : chatId;
     const ts = (Number(msg.t) || Math.floor(Date.now() / 1000)) * 1000;
+
+    const mentioned = msg.mentionedJidList ?? msg.mentionedList ?? [];
+    const mentionsMe = isGroup && !fromMe && !!meDigits
+      && mentioned.some((w) => localDigits(w) === meDigits);
 
     return {
       message: {
@@ -66,6 +93,7 @@
         timestamp: ts,
         fromMe,
         type,
+        mentionsMe,
         // pushName is the *sender*'s name — only safe as a chat name for inbound DMs.
         chatName: (isGroup || fromMe) ? null : (msg.notifyName ?? msg.senderObj?.pushname ?? null),
       },
@@ -77,6 +105,46 @@
 
   function post(payload) {
     window.postMessage({ [TAG]: true, ...payload }, '*');
+  }
+
+  // Which message types the server wants raw bytes for (audio→transcribe,
+  // image→OCR, document→store). Empty unless a provider/STORE_MEDIA is set, so
+  // by default we never download media. bridge.js learns this from /health and
+  // pushes it in via {kind:'mediaConfig'}.
+  let mediaDownloadTypes = [];
+
+  // Blob → base64 (chunked, so large ArrayBuffers don't blow the call stack).
+  async function blobToBase64(blob) {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let binary = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
+  }
+
+  // Download a message's media (only for live messages of an enabled type) and
+  // hand the bytes to bridge.js, which POSTs them to /media. Backfill skips this
+  // on purpose — re-transcribing thousands of old audios would surprise the user
+  // with cost; live voice notes are the day-to-day win.
+  async function maybeDownloadMedia(msg, message) {
+    if (!mediaDownloadTypes.includes(message.type)) return;
+    try {
+      const blob = await window.WPP.chat.downloadMedia(msg);
+      if (!blob) return;
+      const dataB64 = await blobToBase64(blob);
+      post({
+        kind: 'media',
+        id: message.id,
+        type: message.type,
+        mime: blob.type || msg.mimetype || null,
+        filename: msg.filename ?? null,
+        dataB64,
+      });
+    } catch (e) {
+      console.warn('[wab] media download failed', e);
+    }
   }
 
   // The real group title — never the sender (that was the historical bug). Read
@@ -101,6 +169,9 @@
         message.chatName = await resolveGroupTitle(msg.id?.remote ?? msg.from);
       }
       post({ kind: 'ingest', message, contact });
+      // Fire-and-forget: the message is ingested first (so /media finds the row),
+      // then we fetch+upload its bytes for transcription/OCR/storage.
+      maybeDownloadMedia(msg, message);
     } catch (e) {
       console.warn('[wab] normalize failed', e);
     }
@@ -188,13 +259,122 @@
     emitStatus(window.WPP.conn?.isMainReady ? 'connected' : 'needs_auth');
   }
 
-  async function handleSendCommand({ id, chatId, text }) {
+  function fileType(mime) {
+    if (!mime) return 'document';
+    if (mime.startsWith('image/')) return 'image';
+    if (mime.startsWith('video/')) return 'video';
+    if (mime.startsWith('audio/')) return 'audio';
+    return 'document';
+  }
+
+  // Handle a queued send: plain text, a quoted reply, or a media file (base64
+  // inlined by the server). quotedMsgId is the original WA message id.
+  async function handleSendCommand(send) {
+    const { id, chatId, kind, text, caption, quotedMsgId, mime, filename, dataB64 } = send;
     try {
-      const result = await window.WPP.chat.sendTextMessage(toWaJid(chatId), text, { createChat: true });
+      const opts = { createChat: true };
+      if (quotedMsgId) opts.quotedMsg = quotedMsgId;
+      let result;
+      if (kind === 'media' && dataB64) {
+        const dataUrl = `data:${mime || 'application/octet-stream'};base64,${dataB64}`;
+        result = await window.WPP.chat.sendFileMessage(toWaJid(chatId), dataUrl, {
+          type: fileType(mime),
+          filename: filename || undefined,
+          caption: caption || undefined,
+          ...opts,
+        });
+      } else {
+        result = await window.WPP.chat.sendTextMessage(toWaJid(chatId), text, opts);
+      }
       const waMsgId = result?.id?._serialized ?? result?.id ?? null;
       post({ kind: 'sendResult', id, ok: true, waMsgId: waMsgId ? String(waMsgId) : null });
     } catch (e) {
       post({ kind: 'sendResult', id, ok: false, error: String(e?.message ?? e) });
+    }
+  }
+
+  // On-demand: re-download a past message's media (by id) from WhatsApp and push
+  // it to the server with store:true, so it's persisted even if STORE_MEDIA is
+  // off. type is derived from the blob MIME; filename recovered when available.
+  async function handleMediaFetch({ msgId, chatId }) {
+    try {
+      // Get the real message MODEL (not the id string): downloadMedia(idString)
+      // routes through MsgKey.fromString, which chokes on our stored ids (group
+      // @lid participant). The live path passes the model and works, so we page
+      // the chat to find the matching model and pass that.
+      const waChatId = toWaJid(chatId || '');
+      let model = null;
+      try {
+        const msgs = await window.WPP.chat.getMessages(waChatId, { count: 200 });
+        model = (msgs || []).find((m) => (m?.id?._serialized ?? String(m?.id)) === msgId) || null;
+      } catch (e) {
+        console.warn('[wab] media fetch: getMessages failed', e);
+      }
+      if (!model) { console.warn('[wab] media fetch: message not found in chat', msgId); return; }
+
+      // Download from the MODEL directly. WPP.chat.downloadMedia re-resolves via
+      // getMessageById → MsgKey.fromString, which throws on group @lid ids. The
+      // model itself has .downloadMedia() and exposes the decrypted blob via
+      // mediaData.mediaBlob.forceToBlob() — same path wa-js uses internally,
+      // minus the id round-trip.
+      // Replicate wa-js's own blob retrieval: after downloading, the decrypted
+      // bytes land in LruMediaStore / MediaBlobCache keyed by filehash (that's
+      // why mediaData.mediaBlob is usually empty for images).
+      const W = window.WPP.whatsapp || {};
+      const toAB = async (e) => {
+        if (!e) return null;
+        if (e instanceof ArrayBuffer) return e;
+        if (e instanceof Uint8Array) return e.buffer;
+        if (typeof e.arrayBuffer === 'function') return await e.arrayBuffer();
+        if (e.buffer) return e.buffer;
+        return null;
+      };
+      const grabBlob = async () => {
+        const o = model.mediaData;
+        if (!o) return null;
+        const fh = o.filehash;
+        try {
+          if (fh && W.LruMediaStore?.get) {
+            const ab = await toAB(await W.LruMediaStore.get(fh).catch(() => null));
+            if (ab) return new Blob([ab], { type: o.mimetype || 'application/octet-stream' });
+          }
+        } catch (_) { /* */ }
+        try {
+          if (fh && W.MediaBlobCache?.has?.(fh)) {
+            const b = await W.MediaBlobCache.get(fh);
+            if (b) return b;
+          }
+        } catch (_) { /* */ }
+        try {
+          const b = o.mediaBlob?.forceToBlob?.();
+          if (b) return b;
+        } catch (_) { /* */ }
+        return null;
+      };
+      let blob = await grabBlob();
+      if (!blob) {
+        try {
+          await model.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1, isUserInitiated: true });
+        } catch (e) {
+          console.warn('[wab] media fetch: model.downloadMedia failed', e);
+        }
+        blob = await grabBlob();
+      }
+      if (!blob) {
+        console.warn('[wab] media fetch: could not obtain blob for', msgId,
+          '| hasMediaData=', !!model.mediaData, 'filehash=', model.mediaData?.filehash,
+          'Lru=', !!W.LruMediaStore, 'Cache=', !!W.MediaBlobCache);
+        return;
+      }
+      const dataB64 = await blobToBase64(blob);
+      const mime = blob.type || model.mediaData?.mimetype || model.mimetype || null;
+      let type = 'document';
+      if (mime && mime.startsWith('image/')) type = 'image';
+      else if (mime && mime.startsWith('video/')) type = 'video';
+      else if (mime && mime.startsWith('audio/')) type = 'audio';
+      post({ kind: 'media', id: msgId, type, mime, filename: model.filename ?? null, dataB64, store: true });
+    } catch (e) {
+      console.warn('[wab] media fetch failed', e);
     }
   }
 
@@ -271,7 +451,9 @@
     if (!d || d[TAG] !== true) return;
     if (d.kind === 'sendCommand') handleSendCommand(d);
     else if (d.kind === 'backfillCommand') handleBackfill(d);
+    else if (d.kind === 'mediaFetchCommand') handleMediaFetch(d);
     else if (d.kind === 'requestStatus') reportCurrentStatus();
+    else if (d.kind === 'mediaConfig') mediaDownloadTypes = Array.isArray(d.download) ? d.download : [];
   });
 
   function start() {
@@ -285,11 +467,11 @@
 
     // Connection state → so the bridge's /health can tell whether this tab is
     // actually live (vs. logged out / showing the QR) instead of guessing.
-    WPP.on('conn.main_ready', () => { emitStatus('connected'); syncGroupTitles(); });
+    WPP.on('conn.main_ready', () => { emitStatus('connected'); refreshMe(); syncGroupTitles(); });
     WPP.on('conn.require_auth', () => emitStatus('needs_auth'));
     WPP.on('conn.logout', () => emitStatus('logged_out'));
     emitStatus(WPP.conn?.isMainReady ? 'connected' : 'needs_auth');
-    if (WPP.conn?.isMainReady) syncGroupTitles();
+    if (WPP.conn?.isMainReady) { refreshMe(); syncGroupTitles(); }
 
     post({ kind: 'ready' });
     console.log('[wab] connected to WPP, streaming messages to the bridge');

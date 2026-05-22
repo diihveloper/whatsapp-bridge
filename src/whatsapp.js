@@ -3,12 +3,24 @@ import {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  downloadMediaMessage,
 } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
 import pino from 'pino';
 import path from 'node:path';
 import fs from 'node:fs';
 import { saveMessage, updateChatName, upsertContact } from './store.js';
+import { downloadTypes } from './media/index.js';
+import { processMedia } from './media/process.js';
+import { processAlerts } from './alerts.js';
+import { isAllowed } from './whitelist.js';
+
+// WhatsApp send for keyword alerts (baileys backend). Same gate as the public
+// send route: needs ENABLE_SEND and a whitelisted target.
+async function alertSend(jid, text) {
+  if (process.env.ENABLE_SEND !== 'true' || !isAllowed(jid)) return;
+  await sendText(jid, text);
+}
 
 const AUTH_DIR = path.resolve('auth_data');
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -23,11 +35,11 @@ function isIgnoredJid(jid) {
   return !jid || jid.endsWith('@newsletter') || jid === 'status@broadcast';
 }
 
-function extractBody(message) {
+// Peel off the wrapper layers (ephemeral / view-once / edited / doc-with-caption)
+// to reach the real content node. Shared by extractBody and the media helpers.
+function unwrap(message) {
   let m = message?.message;
-  if (!m) return { body: '', type: 'unknown' };
-
-  // unwrap wrappers (ephemeral / view-once / edited / document-with-caption)
+  if (!m) return null;
   for (let i = 0; i < 3; i++) {
     if (m.ephemeralMessage?.message) { m = m.ephemeralMessage.message; continue; }
     if (m.viewOnceMessage?.message) { m = m.viewOnceMessage.message; continue; }
@@ -36,6 +48,31 @@ function extractBody(message) {
     if (m.documentWithCaptionMessage?.message) { m = m.documentWithCaptionMessage.message; continue; }
     break;
   }
+  return m;
+}
+
+// MIME + filename of the media node, for the transcription/OCR/storage pipeline.
+function mediaInfo(message) {
+  const m = unwrap(message);
+  if (!m) return { mime: null, filename: null };
+  const node = m.audioMessage ?? m.imageMessage ?? m.videoMessage ?? m.documentMessage;
+  return { mime: node?.mimetype ?? null, filename: node?.fileName ?? null };
+}
+
+// JIDs the message @-mentions (read from whichever node carries contextInfo).
+function mentionedJids(message) {
+  const m = unwrap(message);
+  if (!m) return [];
+  const node = m.extendedTextMessage ?? m.imageMessage ?? m.videoMessage
+    ?? m.documentMessage ?? m.audioMessage ?? {};
+  return node?.contextInfo?.mentionedJid ?? [];
+}
+// Compare on the bare phone digits, ignoring device suffix / domain differences.
+const localDigits = (jid) => String(jid ?? '').split('@')[0].split(':')[0].replace(/\D/g, '');
+
+function extractBody(message) {
+  const m = unwrap(message);
+  if (!m) return { body: '', type: 'unknown' };
 
   if (m.conversation) return { body: m.conversation, type: 'text' };
   if (m.extendedTextMessage?.text) return { body: m.extendedTextMessage.text, type: 'text' };
@@ -143,6 +180,7 @@ export async function startWhatsApp() {
 
   sock.ev.on('messages.upsert', ({ messages, type }) => {
     if (type !== 'notify' && type !== 'append') return;
+    const inbound = []; // for the keyword watchlist
     for (const message of messages) {
       const chatId = message.key?.remoteJid;
       if (!message.key?.id || isIgnoredJid(chatId)) continue;
@@ -151,6 +189,10 @@ export async function startWhatsApp() {
       const senderJid = isGroup ? message.key.participant : chatId;
       const ts = Number(message.messageTimestamp) * 1000;
       const { body, type: msgType } = extractBody(message);
+
+      const myDigits = localDigits(sock?.user?.id);
+      const mentionsMe = isGroup && !fromMe && myDigits
+        && mentionedJids(message).some((j) => localDigits(j) === myDigits);
 
       saveMessage({
         id: message.key.id,
@@ -164,12 +206,25 @@ export async function startWhatsApp() {
         // name, would pollute the chat's name) and for groups (would overwrite
         // the real group title).
         chatName: (isGroup || fromMe) ? null : (message.pushName ?? null),
+        mentionsMe,
       });
 
       if (!fromMe && senderJid && message.pushName) {
         upsertContact({ jid: senderJid, pushName: message.pushName, lastSeenAt: ts });
       }
+
+      // Media (transcription / OCR / storage). Fire-and-forget: downloading and
+      // transcribing must not block the message stream. Only for enabled types.
+      if (downloadTypes().includes(msgType)) {
+        processBaileysMedia(message, message.key.id, msgType).catch(() => {});
+      }
+
+      if (!fromMe && body) {
+        inbound.push({ id: message.key.id, chatId, body, fromMe, timestamp: ts, chatName: null });
+      }
     }
+    // Keyword watchlist alerts (best-effort, fire-and-forget).
+    processAlerts(inbound, { sendWhatsApp: alertSend }).catch(() => {});
   });
 
   sock.ev.on('contacts.update', (updates) => {
@@ -193,6 +248,21 @@ export async function startWhatsApp() {
   return sock;
 }
 
+// Download a message's media via Baileys and run it through the shared media
+// pipeline (persist + transcribe/OCR). The message must already be saved.
+async function processBaileysMedia(message, id, type) {
+  try {
+    const buffer = await downloadMediaMessage(
+      message, 'buffer', {},
+      { logger: baileysLogger, reuploadRequest: sock.updateMediaMessage }
+    );
+    const { mime, filename } = mediaInfo(message);
+    await processMedia({ id, type, buffer, mime, filename });
+  } catch (e) {
+    console.warn('[baileys] media process failed', e.message);
+  }
+}
+
 export function status() {
   return { connected, hasQR: !!currentQR };
 }
@@ -204,4 +274,17 @@ export function getQR() {
 export async function sendText(chatId, text) {
   if (!sock || !connected) throw new Error('not connected');
   await sock.sendMessage(chatId, { text });
+}
+
+// Send a media file. The Baileys content shape depends on the MIME type. Quoting
+// isn't supported here (would need the original WAMessage) — extension mode does.
+export async function sendMedia(chatId, { buffer, mime, filename, caption }) {
+  if (!sock || !connected) throw new Error('not connected');
+  const cap = caption || undefined;
+  let content;
+  if (mime?.startsWith('image/')) content = { image: buffer, caption: cap };
+  else if (mime?.startsWith('video/')) content = { video: buffer, caption: cap };
+  else if (mime?.startsWith('audio/')) content = { audio: buffer, mimetype: mime };
+  else content = { document: buffer, mimetype: mime || 'application/octet-stream', fileName: filename || 'file', caption: cap };
+  await sock.sendMessage(chatId, content);
 }

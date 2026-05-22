@@ -80,6 +80,22 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_outbound_status
     ON outbound(status, id);
+
+  -- Keyword watchlist hits. One row per (message, keyword); UNIQUE so a
+  -- re-delivered message never fires a second notification. recordAlert returns
+  -- whether the row was new, which gates the push.
+  CREATE TABLE IF NOT EXISTS alerts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    msg_id      TEXT NOT NULL,
+    chat_id     TEXT,
+    keyword     TEXT NOT NULL,
+    body        TEXT,
+    matched_at  INTEGER NOT NULL,
+    UNIQUE(msg_id, keyword)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_alerts_matched
+    ON alerts(matched_at DESC);
 `);
 
 // Defensive migration: messages already exists in older DBs, so add the
@@ -94,6 +110,24 @@ function ensureColumn(table, column, decl) {
 ensureColumn('messages', 'deleted_at', 'INTEGER');
 ensureColumn('messages', 'edited_at', 'INTEGER');
 ensureColumn('messages', 'original_body', 'TEXT');
+// Media handling (audio transcription / image OCR / document download):
+//  - media_path:   relative path under data/media/ of the stored raw file (NULL
+//                  if not persisted — STORE_MEDIA policy decides).
+//  - media_mime:   the file's MIME type (so the download endpoint can serve it).
+//  - media_status: NULL (not media / nothing to do) | 'pending' | 'done' |
+//                  'error' | 'skipped'. Tracks the transcription/OCR lifecycle.
+ensureColumn('messages', 'media_path', 'TEXT');
+ensureColumn('messages', 'media_mime', 'TEXT');
+ensureColumn('messages', 'media_status', 'TEXT');
+// @mention tracking: 1 when the message @-mentions the account owner (groups).
+ensureColumn('messages', 'mentions_me', 'INTEGER');
+// Outbound media/quote support (older DBs created `outbound` text-only).
+ensureColumn('outbound', 'kind', "TEXT");          // 'text' | 'media' (NULL = text)
+ensureColumn('outbound', 'media_path', 'TEXT');    // server-side file to send
+ensureColumn('outbound', 'mime', 'TEXT');
+ensureColumn('outbound', 'filename', 'TEXT');
+ensureColumn('outbound', 'caption', 'TEXT');
+ensureColumn('outbound', 'quoted_msg_id', 'TEXT'); // reply target (WA _serialized id)
 
 db.prepare(`
   INSERT OR IGNORE INTO contacts (jid, push_name, last_seen_at)
@@ -112,8 +146,8 @@ const upsertChatStmt = db.prepare(`
 `);
 
 const insertMessageStmt = db.prepare(`
-  INSERT OR IGNORE INTO messages (id, chat_id, sender, body, timestamp, from_me, type)
-  VALUES (@id, @chatId, @sender, @body, @timestamp, @fromMe, @type)
+  INSERT OR IGNORE INTO messages (id, chat_id, sender, body, timestamp, from_me, type, mentions_me)
+  VALUES (@id, @chatId, @sender, @body, @timestamp, @fromMe, @type, @mentionsMe)
 `);
 
 const saveMessageTx = db.transaction((msg) => {
@@ -132,6 +166,7 @@ const saveMessageTx = db.transaction((msg) => {
     timestamp: msg.timestamp,
     fromMe: msg.fromMe ? 1 : 0,
     type: msg.type ?? null,
+    mentionsMe: msg.mentionsMe ? 1 : 0,
   });
 });
 
@@ -162,6 +197,44 @@ const applyEditStmt = db.prepare(`
 export function applyEdit({ id, body, at = Date.now() } = {}) {
   if (!id) return;
   applyEditStmt.run({ id: String(id), body: body ?? '', at });
+}
+
+// ── Media: persistence + transcription/OCR results ──────────────────────────
+// Record where the raw file was stored (or just flag it as pending processing
+// when nothing is persisted). No-op if the message isn't in the DB yet.
+const attachMediaStmt = db.prepare(`
+  UPDATE messages SET media_path = @path, media_mime = @mime, media_status = @status
+  WHERE id = @id
+`);
+export function attachMedia(id, { path = null, mime = null, status = 'pending' } = {}) {
+  if (!id) return;
+  attachMediaStmt.run({ id: String(id), path, mime, status });
+}
+
+// Fold the transcription/OCR text into body so it shows up in reads AND gets
+// FTS-indexed (the messages_au UPDATE-of-body trigger reindexes). We keep a
+// short type tag prefix so a reader still knows it originated as audio/image.
+const setMediaTextStmt = db.prepare(`
+  UPDATE messages SET body = @body, media_status = @status WHERE id = @id
+`);
+export function setMediaText(id, body, { status = 'done' } = {}) {
+  if (!id) return;
+  setMediaTextStmt.run({ id: String(id), body: body ?? '', status });
+}
+
+const setMediaStatusStmt = db.prepare(`UPDATE messages SET media_status = @status WHERE id = @id`);
+export function setMediaStatus(id, status) {
+  if (!id) return;
+  setMediaStatusStmt.run({ id: String(id), status });
+}
+
+// Used by the download endpoint and the processing pipeline to look up a row.
+export function getMessageById(id) {
+  return db.prepare(`
+    SELECT id, chat_id AS chatId, sender, body, timestamp, from_me AS fromMe, type,
+           media_path AS mediaPath, media_mime AS mediaMime, media_status AS mediaStatus
+    FROM messages WHERE id = ?
+  `).get(String(id));
 }
 
 // Rename only: must NOT touch unread or last_message_at (a title refresh isn't
@@ -211,7 +284,8 @@ export function getMessages(chatId, { limit = 50, since } = {}) {
     SELECT m.id, m.chat_id AS chatId, m.sender,
            COALESCE(ct.verified_name, ct.notify_name, ct.push_name) AS senderName,
            m.body, m.timestamp, m.from_me AS fromMe, m.type,
-           m.deleted_at AS deletedAt, m.edited_at AS editedAt, m.original_body AS originalBody
+           m.deleted_at AS deletedAt, m.edited_at AS editedAt, m.original_body AS originalBody,
+           m.media_path AS mediaPath, m.media_mime AS mediaMime, m.media_status AS mediaStatus
     FROM messages m
     LEFT JOIN contacts ct ON ct.jid = m.sender
     WHERE m.chat_id = ? ${sinceClause.replace('timestamp', 'm.timestamp')}
@@ -293,11 +367,17 @@ export function searchContacts(query, { limit = 20 } = {}) {
 }
 
 const enqueueSendStmt = db.prepare(`
-  INSERT INTO outbound (chat_id, text, created_at) VALUES (@chatId, @text, @now)
+  INSERT INTO outbound (chat_id, text, kind, media_path, mime, filename, caption, quoted_msg_id, created_at)
+  VALUES (@chatId, @text, @kind, @mediaPath, @mime, @filename, @caption, @quotedMsgId, @now)
 `);
 
-export function enqueueSend({ chatId, text }) {
-  const info = enqueueSendStmt.run({ chatId, text, now: Date.now() });
+export function enqueueSend({
+  chatId, text = '', kind = 'text',
+  mediaPath = null, mime = null, filename = null, caption = null, quotedMsgId = null,
+}) {
+  const info = enqueueSendStmt.run({
+    chatId, text, kind, mediaPath, mime, filename, caption, quotedMsgId, now: Date.now(),
+  });
   return Number(info.lastInsertRowid);
 }
 
@@ -307,7 +387,10 @@ export function enqueueSend({ chatId, text }) {
 const claimPendingTx = db.transaction((limit, staleMs) => {
   const cutoff = Date.now() - staleMs;
   const rows = db.prepare(`
-    SELECT id, chat_id AS chatId, text FROM outbound
+    SELECT id, chat_id AS chatId, text,
+           COALESCE(kind, 'text') AS kind, media_path AS mediaPath, mime, filename,
+           caption, quoted_msg_id AS quotedMsgId
+    FROM outbound
     WHERE status = 'pending'
        OR (status = 'sending' AND COALESCE(claimed_at, 0) < ?)
     ORDER BY id ASC
@@ -342,6 +425,8 @@ export function markSendResult(id, { ok, error = null, waMsgId = null } = {}) {
 export function getSend(id) {
   return db.prepare(`
     SELECT id, chat_id AS chatId, text, status, error, wa_msg_id AS waMsgId,
+           COALESCE(kind, 'text') AS kind, media_path AS mediaPath, mime, filename,
+           caption, quoted_msg_id AS quotedMsgId,
            created_at AS createdAt, updated_at AS updatedAt
     FROM outbound WHERE id = ?
   `).get(id);
@@ -375,4 +460,86 @@ export function getContact(jid) {
            last_seen_at AS lastSeenAt
     FROM contacts WHERE jid = ?
   `).get(jid);
+}
+
+// ── Digest: unread chats + their recent messages, for a summary ──────────────
+// We only track per-chat unread counts (not per-message read state), so the
+// "unread" messages are approximated by the last `unread` messages in the chat
+// (capped). Good enough to summarize what arrived while you were away.
+export function getUnreadDigest({ chatLimit = 30, maxPerChat = 15 } = {}) {
+  const chats = db.prepare(`
+    SELECT id AS jid, name, is_group AS isGroup, unread, last_message_at AS lastMessageAt
+    FROM chats
+    WHERE unread > 0 AND id NOT LIKE '%@newsletter' AND id <> 'status@broadcast'
+    ORDER BY last_message_at DESC
+    LIMIT ?
+  `).all(chatLimit);
+  return chats.map((c) => ({
+    ...c,
+    messages: getMessages(c.jid, { limit: Math.min(c.unread || maxPerChat, maxPerChat) }),
+  }));
+}
+
+// ── Pending replies: chats whose last message is theirs (not ours) and has been
+//    sitting unanswered for more than `hours`. Oldest-waiting first. ──────────
+export function getPendingReplies({ hours = 3, limit = 50, includeGroups = true } = {}) {
+  const cutoff = Date.now() - hours * 3600000;
+  const groupClause = includeGroups ? '' : 'AND c.is_group = 0';
+  return db.prepare(`
+    SELECT c.id AS jid, c.name, c.is_group AS isGroup, c.unread,
+           m.body AS lastBody, m.timestamp AS lastAt, m.sender AS lastSender,
+           COALESCE(ct.verified_name, ct.notify_name, ct.push_name) AS senderName
+    FROM chats c
+    JOIN messages m ON m.id = (
+      SELECT id FROM messages WHERE chat_id = c.id ORDER BY timestamp DESC LIMIT 1
+    )
+    LEFT JOIN contacts ct ON ct.jid = m.sender
+    WHERE m.from_me = 0 AND m.timestamp < ?
+      AND c.id NOT LIKE '%@newsletter' AND c.id <> 'status@broadcast'
+      ${groupClause}
+    ORDER BY m.timestamp ASC
+    LIMIT ?
+  `).all(cutoff, limit);
+}
+
+// ── Alerts (keyword watchlist) ───────────────────────────────────────────────
+const recordAlertStmt = db.prepare(`
+  INSERT OR IGNORE INTO alerts (msg_id, chat_id, keyword, body, matched_at)
+  VALUES (@msgId, @chatId, @keyword, @body, @at)
+`);
+// Returns true only when the row is new, so the caller fires the push exactly
+// once even if the same message is re-ingested.
+export function recordAlert({ msgId, chatId = null, keyword, body = '', at = Date.now() }) {
+  if (!msgId || !keyword) return false;
+  return recordAlertStmt.run({ msgId: String(msgId), chatId, keyword, body, at }).changes > 0;
+}
+
+// ── @mentions: messages that tagged the account owner (mostly groups) ────────
+export function getMentions({ limit = 30, since } = {}) {
+  const params = [];
+  let sinceClause = '';
+  if (since) { sinceClause = 'AND m.timestamp >= ?'; params.push(since); }
+  params.push(limit);
+  return db.prepare(`
+    SELECT m.id, m.chat_id AS chatId, c.name AS chatName, c.is_group AS isGroup,
+           m.sender, COALESCE(ct.verified_name, ct.notify_name, ct.push_name) AS senderName,
+           m.body, m.timestamp, m.deleted_at AS deletedAt
+    FROM messages m
+    LEFT JOIN chats c ON c.id = m.chat_id
+    LEFT JOIN contacts ct ON ct.jid = m.sender
+    WHERE m.mentions_me = 1 ${sinceClause}
+    ORDER BY m.timestamp DESC
+    LIMIT ?
+  `).all(...params);
+}
+
+export function listAlerts({ limit = 30 } = {}) {
+  return db.prepare(`
+    SELECT a.id, a.msg_id AS msgId, a.chat_id AS chatId, c.name AS chatName,
+           a.keyword, a.body, a.matched_at AS matchedAt
+    FROM alerts a
+    LEFT JOIN chats c ON c.id = a.chat_id
+    ORDER BY a.matched_at DESC
+    LIMIT ?
+  `).all(limit);
 }

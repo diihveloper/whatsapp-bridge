@@ -1,0 +1,17 @@
+# Watchlist de palavras-chave para alertas.
+# Copie para watchlist.txt (cp watchlist.example.txt watchlist.txt).
+# Uma palavra/frase por linha. Quando uma mensagem RECEBIDA contém o termo,
+# o bridge dispara os canais de alerta configurados no .env
+# (ALERT_WHATSAPP_TO e/ou ALERT_WEBHOOK_URL).
+#
+# - Match é por substring, sem diferenciar maiúsculas/minúsculas.
+# - Linhas começando com # são comentários.
+# - O arquivo é recarregado ao salvar — não precisa reiniciar.
+# - Para regex (avançado), envolva em barras: /urgent[ei]/i
+
+boleto
+urgente
+cancelar
+reembolso
+# nome de um cliente importante:
+# Fulano da Silva

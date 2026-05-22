@@ -9,8 +9,14 @@
 //   wa read <name|jid> [--limit N] [--since <ISO|ms>] [--days N] [--backfill] [--json]
 //   wa search <text...> [--limit N] [--json]
 //   wa chats [--unread] [--limit N] [--json]
+//   wa digest [--summarize] [--limit N] [--json]
+//   wa pending [--hours N] [--dm] [--limit N] [--json]
+//   wa alerts [--limit N] [--json]
+//   wa mentions [--limit N] [--days N] [--json]
+//   wa export <name|jid> [--days N] [--limit N] [--out file.md] [--json]
+//   wa media <msgId> [--out file]
 //   wa who <name|jid> [--json]
-//   wa send <name|jid> <text...> [--json]
+//   wa send <name|jid> <text...> [--file <path|url>] [--caption "..."] [--reply <msgId>] [--json]
 //   wa aliases [--json] | wa aliases add <name> <jid> | wa aliases rm <name>
 //
 // Config: ~/.whatsapp-bridge/config.json (or env WA_BRIDGE_URL / WA_BRIDGE_TOKEN).
@@ -77,6 +83,8 @@ function fmtTime(ms) {
   return `${pad(d.getDate())}/${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 const jidTail = (jid) => String(jid || '').split('@')[0];
+const EXT_BY_MIME = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif', 'video/mp4': '.mp4', 'video/quicktime': '.mov', 'audio/ogg': '.ogg', 'audio/mpeg': '.mp3', 'audio/mp4': '.m4a', 'application/pdf': '.pdf', 'application/zip': '.zip' };
+const extFromMime = (mime) => EXT_BY_MIME[mime] || '';
 
 function speaker(m, target, isGroup) {
   if (m.fromMe) return 'eu';
@@ -85,12 +93,49 @@ function speaker(m, target, isGroup) {
   return jidTail(m.sender);
 }
 
+const MEDIA_ICON = { audio: '🎙️', image: '🖼️', video: '🎬', document: '📎', sticker: '🩷' };
+const PLACEHOLDER = /^\[(audio|image|video|document|sticker)\]$/i;
+
 function fmtMessage(m, target, isGroup) {
   let body = m.body ?? '';
+  const icon = MEDIA_ICON[m.type];
+  if (icon) {
+    // Audio transcript / image OCR is folded into body; show the icon + text.
+    // If still just the placeholder, show only the icon (+ a processing hint).
+    body = PLACEHOLDER.test(body.trim()) ? icon : `${icon} ${body}`;
+    if (m.mediaStatus === 'pending') body += ' (processando…)';
+    else if (m.mediaStatus === 'error') body += ' (falha ao processar)';
+  }
   if (m.deletedAt) body = `[apagada] ${body}`.trim();
   let line = `${fmtTime(m.timestamp)}  ${speaker(m, target, isGroup)}: ${body}`;
   if (m.editedAt) line += '  (editada)';
   return line;
+}
+
+// Markdown transcript for `wa export` — fed to the document skill to render an
+// LI-styled .docx/PDF, or used as-is.
+function buildExportMarkdown(data, t, isGroup) {
+  const msgs = data.messages || [];
+  const first = msgs.length ? fmtTime(msgs[0].timestamp) : '—';
+  const last = msgs.length ? fmtTime(msgs[msgs.length - 1].timestamp) : '—';
+  const out = [
+    `# Conversa: ${t.name || jidTail(t.jid)}`, '',
+    `- **JID:** ${t.jid}`,
+    `- **Tipo:** ${isGroup ? 'Grupo' : 'Conversa individual'}`,
+    `- **Mensagens:** ${msgs.length}`,
+    `- **Período:** ${first} – ${last}`,
+    `- **Exportado em:** ${fmtTime(Date.now())}`,
+    '', '---', '',
+  ];
+  for (const m of msgs) {
+    let body = m.body ?? '';
+    const icon = MEDIA_ICON[m.type];
+    if (icon) body = PLACEHOLDER.test(body.trim()) ? icon : `${icon} ${body}`;
+    if (m.deletedAt) body = `[apagada] ${body}`.trim();
+    const who = m.fromMe ? 'eu' : (m.senderName || (!isGroup && t.name) || jidTail(m.sender));
+    out.push(`**[${fmtTime(m.timestamp)}] ${who}:** ${body}${m.editedAt ? ' _(editada)_' : ''}`, '');
+  }
+  return out.join('\n');
 }
 
 function printConversation(d, { json }) {
@@ -123,6 +168,15 @@ const commands = {
     const conn = data.connected ? 'connected' : 'disconnected';
     const ext = data.extension ? ` (tab: ${data.extension.state})` : '';
     console.log(`mode: ${data.mode} | ${conn}${ext} | sending: ${data.sendEnabled ? 'ON' : 'off'}`);
+    if (data.media) {
+      const md = data.media;
+      console.log(`media: transcribe=${md.transcribe} | ocr=${md.ocr} | store=${md.store}`);
+    }
+    if (data.summary) console.log(`summary: ${data.summary.provider}`);
+    if (data.watchlist) {
+      const w = data.watchlist;
+      console.log(`watchlist: ${w.keywords} palavra(s) | canais: ${w.channels.length ? w.channels.join(', ') : 'nenhum'}`);
+    }
     console.log(`messages: ${data.messages} | chats: ${data.chats} | contacts: ${data.contacts}`);
   },
 
@@ -169,6 +223,75 @@ const commands = {
     }
   },
 
+  async digest({ flags }) {
+    const qs = new URLSearchParams();
+    if (flags.limit) qs.set('limit', flags.limit);
+    if (flags.summarize) qs.set('summarize', 'true');
+    const { data } = await api('/digest?' + qs.toString());
+    if (flags.json) return console.log(JSON.stringify(data, null, 2));
+    if (data.summaryError) console.log(`(resumo server-side indisponível: ${data.summaryError})\n`);
+    if (data.summary) return console.log(data.summary);
+    if (!data.chats.length) return console.log('Nenhuma conversa não lida. 🎉');
+    // No server-side summary: print the grouped data so the caller can summarize.
+    for (const c of data.chats) {
+      console.log(`\n## ${c.name || jidTail(c.jid)}${c.isGroup ? ' [grupo]' : ''}  (${c.unread} não lida(s))`);
+      const isGroup = String(c.jid).endsWith('@g.us');
+      for (const m of c.messages) console.log(fmtMessage(m, { name: c.name }, isGroup));
+    }
+  },
+
+  async pending({ flags }) {
+    const qs = new URLSearchParams();
+    if (flags.hours) qs.set('hours', flags.hours);
+    if (flags.limit) qs.set('limit', flags.limit);
+    if (flags.dm) qs.set('groups', 'false');
+    const { data } = await api('/pending?' + qs.toString());
+    if (flags.json) return console.log(JSON.stringify(data, null, 2));
+    if (!data.pending.length) return console.log(`Ninguém esperando resposta há mais de ${data.hours}h. 🎉`);
+    console.log(`Esperando resposta há mais de ${data.hours}h (${data.pending.length}):`);
+    for (const p of data.pending) {
+      const waited = ((Date.now() - p.lastAt) / 3600000).toFixed(1);
+      const who = p.name || p.senderName || jidTail(p.jid);
+      const snippet = (p.lastBody || '').replace(/\s+/g, ' ').slice(0, 80);
+      console.log(`  • ${who}${p.isGroup ? ' [grupo]' : ''} — ${waited}h — "${snippet}"  (${p.jid})`);
+    }
+  },
+
+  async alerts({ flags }) {
+    const qs = new URLSearchParams();
+    if (flags.limit) qs.set('limit', flags.limit);
+    const { data } = await api('/alerts?' + qs.toString());
+    if (flags.json) return console.log(JSON.stringify(data, null, 2));
+    console.log(`Watchlist: ${data.keywords.length ? data.keywords.join(', ') : '(vazia — crie watchlist.txt)'}`);
+    console.log(`Canais: ${data.channels.length ? data.channels.join(', ') : '(nenhum configurado no .env)'}`);
+    if (!data.alerts.length) return console.log('Nenhum alerta registrado.');
+    console.log(`\nÚltimos ${data.alerts.length}:`);
+    for (const a of data.alerts) {
+      const snippet = (a.body || '').replace(/\s+/g, ' ').slice(0, 80);
+      console.log(`  ${fmtTime(a.matchedAt)}  [${a.keyword}] ${a.chatName || jidTail(a.chatId)}: ${snippet}`);
+    }
+  },
+
+  async media({ flags, pos }) {
+    const msgId = pos.join(' ').trim();
+    if (!msgId) fail('usage: wa media <msgId> [--out file]  (get the msgId from `wa read --json`)');
+    // Ask the tab to (re)download the media for this message and store it.
+    const { status, data } = await api('/messages/' + encodeURIComponent(msgId) + '/fetch-media', { method: 'POST' });
+    if (flags.json) return console.log(JSON.stringify({ status, ...data }, null, 2));
+    if (status === 202) return console.log(`Mídia ainda não disponível: ${data.note || 'tente de novo em instantes'}`);
+    if (!data.ok) return console.log(`Falha (${status}): ${data.error || 'erro desconhecido'}`);
+    // Download the bytes and save.
+    const out = flags.out || `media_${msgId.replace(/[^A-Za-z0-9]/g, '_').slice(0, 40)}${extFromMime(data.mime)}`;
+    let res;
+    try {
+      res = await fetch(cfg.baseUrl + '/messages/' + encodeURIComponent(msgId) + '/media', { headers: { Authorization: 'Bearer ' + cfg.token } });
+    } catch (e) { fail(`Cannot reach the service (${e.message}).`); }
+    if (!res.ok) return console.log(`Mídia registrada, mas não consegui baixar o arquivo (${res.status}).`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    fs.writeFileSync(out, buf);
+    console.log(`Mídia salva em ${out}  (${data.mime || 'tipo desconhecido'}, ${buf.length} bytes)`);
+  },
+
   async who({ flags, pos }) {
     const name = pos.join(' ').trim();
     if (!name) fail('usage: wa who <name|jid>');
@@ -182,7 +305,8 @@ const commands = {
   async send({ flags, pos }) {
     const name = pos.shift();
     const text = pos.join(' ').trim();
-    if (!name || !text) fail('usage: wa send <name|jid> <text...>');
+    const file = typeof flags.file === 'string' ? flags.file : null;
+    if (!name || (!text && !file)) fail('usage: wa send <name|jid> <text...> [--file <path|url>] [--caption "..."] [--reply <msgId>]');
     // resolve first so we send to the right chat (and fail loudly on ambiguity)
     const { data: r } = await api('/conversation?limit=1&name=' + encodeURIComponent(name));
     if (!r.found) {
@@ -191,11 +315,59 @@ const commands = {
       process.exit(1);
     }
     const jid = r.target.jid;
-    const { status, data } = await api('/chats/' + encodeURIComponent(jid) + '/messages', { method: 'POST', body: { text } });
+    const body = {};
+    if (file) {
+      body.media = /^https?:\/\//i.test(file) ? { url: file } : { path: file };
+      const cap = typeof flags.caption === 'string' ? flags.caption : text;
+      if (cap) body.caption = cap;
+    } else {
+      body.text = text;
+    }
+    if (flags.reply) body.quotedMsgId = String(flags.reply);
+    const { status, data } = await api('/chats/' + encodeURIComponent(jid) + '/messages', { method: 'POST', body });
     if (flags.json) return console.log(JSON.stringify({ jid, status, ...data }, null, 2));
-    if (status === 200) console.log(`Sent to ${r.target.name || jidTail(jid)} (${jid}).`);
+    const what = file ? `file ${file}` : 'message';
+    if (status === 200) console.log(`Sent ${what} to ${r.target.name || jidTail(jid)} (${jid}).`);
     else if (status === 202) console.log(`Queued for ${jid}; the WhatsApp Web tab didn't confirm yet. Make sure it's open.`);
     else console.log(`Not sent (${status}): ${data.error || 'unknown error'}`);
+  },
+
+  async mentions({ flags }) {
+    const qs = new URLSearchParams();
+    if (flags.limit) qs.set('limit', flags.limit);
+    if (flags.days) qs.set('days', flags.days);
+    const { data } = await api('/mentions?' + qs.toString());
+    if (flags.json) return console.log(JSON.stringify(data, null, 2));
+    if (!data.mentions.length) return console.log('Nenhuma menção a você registrada.');
+    console.log(`Você foi mencionado ${data.mentions.length}x:`);
+    for (const m of data.mentions) {
+      const who = m.senderName || jidTail(m.sender);
+      const snippet = (m.body || '').replace(/\s+/g, ' ').slice(0, 100);
+      console.log(`  ${fmtTime(m.timestamp)}  ${m.chatName || jidTail(m.chatId)} — ${who}: ${snippet}`);
+    }
+  },
+
+  async export({ flags, pos }) {
+    const name = pos.join(' ').trim();
+    if (!name) fail('usage: wa export <name|jid> [--days N] [--limit N] [--out file.md]');
+    const qs = new URLSearchParams({ name, limit: flags.limit || '500' });
+    if (flags.days) qs.set('days', flags.days);
+    const { data } = await api('/conversation?' + qs.toString());
+    if (flags.json) return console.log(JSON.stringify(data, null, 2));
+    if (!data.found) {
+      if (data.ambiguous) { console.log(`Ambíguo "${name}":`); for (const c of data.candidates) console.log(`  • ${c.name || jidTail(c.jid)}  (${c.jid})`); }
+      else console.log(`Nenhuma conversa para "${name}".`);
+      process.exit(1);
+    }
+    const t = data.target;
+    const isGroup = String(t.jid).endsWith('@g.us');
+    const md = buildExportMarkdown(data, t, isGroup);
+    if (flags.out) {
+      fs.writeFileSync(flags.out, md);
+      console.log(`Exportado ${data.count} mensagem(ns) de "${t.name || jidTail(t.jid)}" para ${flags.out}`);
+    } else {
+      console.log(md);
+    }
   },
 
   async aliases({ flags, pos }) {
@@ -224,7 +396,7 @@ const [cmd, ...rest] = process.argv.slice(2);
 const handler = commands[cmd];
 if (!handler) {
   console.log('wa — whatsapp-bridge CLI\n');
-  console.log('commands: health | read | search | chats | who | send | aliases');
+  console.log('commands: health | read | search | chats | digest | pending | alerts | mentions | export | media | who | send | aliases');
   console.log('run "wa <command>" with --help-style usage shown on missing args.');
   process.exit(cmd ? 1 : 0);
 }

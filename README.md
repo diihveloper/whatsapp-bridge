@@ -126,6 +126,74 @@ Opções disponíveis:
 | `BRIDGE_MODE`       | `extension`   | Como conectar: `extension` (padrão) ou `baileys`. Veja as seções "Como rodar" acima. |
 | `ENABLE_SEND`       | `false`       | Defina `true` pra liberar `POST /chats/:id/messages`.        |
 | `BAILEYS_LOG_LEVEL` | `warn`        | Verbosidade interna do Baileys. Suba pra `info`/`debug` só quando estiver investigando problema na conexão WA. |
+| `TRANSCRIBE_PROVIDER` | `off`       | Transcrição de áudio: `off` \| `groq` \| `openai` \| `whisper-local`. Veja "Mídia" abaixo. |
+| `OCR_PROVIDER`      | `off`         | OCR/descrição de imagem: `off` \| `claude` \| `groq` \| `tesseract`. |
+| `STORE_MEDIA`       | `off`         | Guardar arquivos em `data/media/` p/ download: `off` \| `processed` \| `documents` \| `all`. |
+| `GROQ_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | Chave do provedor escolhido (só a que você usa). |
+| `MEDIA_MAX_BYTES`   | `20971520`    | Tamanho máximo (bytes) de mídia baixada/processada (20 MB). |
+| `TRANSCRIBE_LANGUAGE` | `pt`        | Dica de idioma (ISO-639-1) pra transcrição; `""` = automático. |
+
+## Mídia: transcrição de áudio e OCR de imagem
+
+Por padrão, áudios e imagens entram no banco só como `[audio]` / `[image]`. Você pode ligar **transcrição de voz** e **OCR/descrição de imagem** — tudo opcional, escolhido no `.env`, e **nada sai da máquina** até você ativar e colocar a chave. O texto resultante é "dobrado" na própria mensagem (aparece no `wa read` como `🎙️ <transcrição>` / `🖼️ <texto>`) e entra na **busca full-text**.
+
+**Transcrição de áudio** (`TRANSCRIBE_PROVIDER`):
+
+| Valor | O que usa | Observações |
+|-------|-----------|-------------|
+| `off` | — | padrão |
+| `groq` | Groq Whisper (nuvem) | rápido, free tier; precisa de `GROQ_API_KEY` |
+| `openai` | OpenAI Whisper (nuvem) | ~US$0,006/min; precisa de `OPENAI_API_KEY` |
+| `whisper-local` | whisper.cpp offline | privado, sem chave; precisa de `ffmpeg` no PATH e `npm i nodejs-whisper && npx nodejs-whisper download` |
+
+**OCR / descrição de imagem** (`OCR_PROVIDER`):
+
+| Valor | O que usa | Observações |
+|-------|-----------|-------------|
+| `off` | — | padrão |
+| `claude` | Anthropic (visão) | OCR + descrição num call só, ótimo p/ boleto/comprovante; precisa de `ANTHROPIC_API_KEY` |
+| `groq` | Groq (visão Llama) | mesma `GROQ_API_KEY` do áudio |
+| `tesseract` | Tesseract local | offline, só extrai texto; `npm i tesseract.js` |
+
+Exemplo de `.env` (Groq pro áudio, Claude pra imagem, guardando os processados):
+
+```
+TRANSCRIBE_PROVIDER=groq
+OCR_PROVIDER=claude
+STORE_MEDIA=processed
+GROQ_API_KEY=gsk_...
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Notas:
+
+- **Só mensagens novas** são processadas — o backfill de histórico *não* baixa mídia de propósito (evita transcrever milhares de áudios antigos e gastar à toa).
+- Provedores de nuvem (groq/openai/claude) não exigem dependência extra (usam `fetch`). Os locais (`tesseract`/`whisper-local`) você instala só se for usá-los.
+- `STORE_MEDIA` controla se o arquivo bruto é guardado em `data/media/` (pra baixar via `GET /chats/:id/messages/:msgId/media`). Com `off`, a transcrição/OCR ainda funciona — o arquivo é descartado depois.
+- Confira o estado atual com `npm run wa -- health` (linha `media:`).
+- **Baixar/analisar um arquivo recebido:** mesmo com `STORE_MEDIA=off`, você pode re-baixar uma mídia antiga do WhatsApp sob demanda: `npm run wa -- media <msgId> --out arquivo.ext` (pegue o `msgId` com `wa read <nome> --json`). Precisa da aba do WhatsApp Web aberta e que a mídia ainda exista no WhatsApp.
+
+## Resumo diário, pendentes e alertas
+
+Três recursos pro dia-a-dia, em cima do que a ponte já guarda:
+
+- **Resumo de não-lidas** — `npm run wa -- digest` agrupa as conversas com mensagens não lidas. Por padrão devolve os dados estruturados e **quem lê resume** (ex.: você pedindo "resume meu WhatsApp" pro Claude, ou um agente agendado via `/schedule` às 8h). Se quiser o resumo gerado pelo próprio serviço, ligue `SUMMARY_PROVIDER` (`groq`/`openai`/`claude`) no `.env` e use `wa digest --summarize`.
+- **Quem está esperando resposta** — `npm run wa -- pending [--hours N] [--dm]` lista os chats cuja última mensagem é deles (não sua) e está sem resposta há mais de N horas (padrão 3), do que espera há mais tempo pro mais recente. Bom pra não perder cliente.
+- **Watchlist de palavras-chave** — coloque termos em `watchlist.txt` (copie de `watchlist.example.txt`); quando uma mensagem recebida bate um termo, a ponte registra (veja `wa alerts`) e dispara os canais configurados no `.env`:
+  - `ALERT_WHATSAPP_TO` — manda o alerta como mensagem de WhatsApp pra esse número/JID (ex.: você mesmo). Reusa o envio → exige `ENABLE_SEND=true` **e** o número na `send_whitelist.txt`.
+  - `ALERT_WEBHOOK_URL` — faz `POST` de um JSON pra essa URL (compatível com ntfy.sh, webhook de Discord/Slack, ou seu serviço).
+
+  Sem nenhum canal, os hits ficam só registrados (úteis em `wa alerts` e no digest). Só mensagens recentes disparam alerta (mensagens antigas vindas de backfill são ignoradas).
+
+## Enviar mídia, responder citando e @menções
+
+- **Responder citando** uma mensagem específica: `npm run wa -- send <nome> "texto" --reply <msgId>` (pegue o `msgId` com `wa read <nome> --json`). Funciona no modo extensão; no modo baileys envia sem a citação.
+- **Enviar arquivo** (imagem, PDF, etc.): `npm run wa -- send <nome> --file <caminho-ou-url> [--caption "legenda"]`. O caminho pode ser um arquivo local **ou** uma URL — o serviço lê/baixa (respeitando `MEDIA_MAX_BYTES`) e envia. Mesmo gate de envio (`ENABLE_SEND` + whitelist).
+- **@menções a você** em grupos: `npm run wa -- mentions` lista onde te marcaram. (A extensão precisa estar atualizada/recarregada pra capturar isso nas mensagens novas.)
+
+## Exportar conversa para documento
+
+`npm run wa -- export <nome> [--days N] [--out conversa.md]` gera um Markdown limpo da conversa (cabeçalho + mensagens com horário). Para um documento no padrão visual da Loja Interativa, exporte e depois peça ao Claude pra montar o `.docx`/PDF com a skill `edicao-documentos-loja-interativa` usando esse conteúdo.
 
 ## Mantendo a extensão atualizada
 
@@ -188,8 +256,15 @@ Todos os endpoints exceto `/health` exigem `Authorization: Bearer <apiToken>` (t
 | GET    | `/chats/:id/messages?limit=50&since=<ms>` | Mais antigas primeiro dentro da página |
 | POST   | `/chats/:id/read`                    | Zera flag de não lidas                 |
 | GET    | `/search?q=<texto>&limit=20`         | Busca FTS5 no corpo das mensagens      |
+| GET    | `/digest?limit=30&summarize=true`    | Não-lidas agrupadas; `summarize=true` resume server-side (se `SUMMARY_PROVIDER`) |
+| GET    | `/pending?hours=3&limit=50`          | Chats esperando sua resposta há mais de N horas |
+| GET    | `/alerts?limit=30`                   | Últimos hits da watchlist de palavras-chave |
+| GET    | `/mentions?limit=30&days=N`          | Mensagens em que você foi @-mencionado |
 | GET    | `/send/whitelist`                    | Lista os chats atualmente permitidos   |
-| POST   | `/chats/:id/messages`                | `{ "text": "..." }` — exige `ENABLE_SEND` **e** chat na whitelist |
+| POST   | `/chats/:id/messages`                | `{ text }`, reply `{ text, quotedMsgId }` ou mídia `{ media:{path\|url}, caption?, quotedMsgId? }` — exige `ENABLE_SEND` **e** chat na whitelist |
+| GET    | `/chats/:id/messages/:msgId/media`   | Baixa o arquivo de mídia guardado (se `STORE_MEDIA` o mantiver) |
+| POST   | `/messages/:msgId/fetch-media`       | Re-baixa a mídia de uma mensagem antiga do WhatsApp e guarda (força persistência) |
+| GET    | `/messages/:msgId/media`             | Baixa o arquivo de mídia guardado, pelo id da mensagem |
 
 Exemplo:
 

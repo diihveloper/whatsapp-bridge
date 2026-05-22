@@ -3,12 +3,20 @@ import {
   listChats, getMessages, searchMessages, markChatRead, stats,
   searchContacts, getContact, searchChatsByName, getChat,
   saveMessage, upsertContact, markDeleted, applyEdit, lastMessageTimestamp,
-  updateChatName,
+  updateChatName, getMessageById,
   enqueueSend, claimPending, markSendResult, getSend,
+  getUnreadDigest, getPendingReplies, listAlerts, getMentions,
 } from './store.js';
-import { status, getQR, sendText } from './whatsapp.js';
+import { status, getQR, sendText, sendMedia } from './whatsapp.js';
 import { isAllowed, listAllowed } from './whitelist.js';
 import { resolveAlias, listAliases, addAlias, removeAlias } from './aliases.js';
+import { getMediaConfig } from './media/index.js';
+import { processMedia, mediaFileAbsPath } from './media/process.js';
+import { summarize, summaryEnabled, summaryProvider } from './ai.js';
+import { processAlerts, alertChannels } from './alerts.js';
+import { listKeywords } from './watchlist.js';
+import fs from 'node:fs';
+import path from 'node:path';
 
 // How long /chats/:id/messages waits for the extension to confirm a queued send
 // before returning "still pending". With SSE push the tab usually confirms in
@@ -22,12 +30,96 @@ const SEND_POLL_MS = 250;
 const BACKFILL_WAIT_MS = 25000;
 const BACKFILL_DEFAULT_MAX = 2000; // safety cap on messages pulled per backfill
 const AUTO_BACKFILL_COOLDOWN_MS = 60000; // debounce auto-backfill on reconnect
+const MEDIA_FETCH_WAIT_MS = 25000; // how long /messages/:id/fetch-media waits for the tab
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Staged outbound media (downloaded from a URL) lives here until the send is
+// confirmed, then it's cleaned up. Files sent from a disk path are never touched.
+const OUTBOUND_MEDIA_DIR = path.resolve('data', 'outbound_media');
+
+const MIME_BY_EXT = {
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif',
+  '.webp': 'image/webp', '.mp4': 'video/mp4', '.mov': 'video/quicktime',
+  '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.opus': 'audio/ogg', '.m4a': 'audio/mp4',
+  '.wav': 'audio/wav', '.pdf': 'application/pdf', '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.zip': 'application/zip', '.txt': 'text/plain', '.csv': 'text/csv',
+};
+const EXT_BY_MIME = Object.fromEntries(Object.entries(MIME_BY_EXT).map(([e, m]) => [m, e]));
+const mimeFromName = (name) => MIME_BY_EXT[path.extname(name).toLowerCase()] || 'application/octet-stream';
+const extFromMime = (mime) => EXT_BY_MIME[mime] || '.bin';
+
 export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
   const app = express();
-  app.use(express.json({ limit: '2mb' }));
+  const media = getMediaConfig();
+  // Base64-encoded media inflates ~33%, plus JSON overhead — size the /media
+  // body limit off MEDIA_MAX_BYTES (with headroom). Other routes stay at 2mb.
+  const mediaJson = express.json({ limit: Math.ceil(media.maxBytes * 1.4) + 1024 });
+  app.use((req, res, next) =>
+    req.path === '/media' ? mediaJson(req, res, next) : express.json({ limit: '2mb' })(req, res, next));
+
+  // Resolve an outbound media spec ({ path } | { url }) to a local file +
+  // metadata, enforcing the size cap. URL downloads are staged under
+  // OUTBOUND_MEDIA_DIR (staged:true → cleaned up after send); disk paths are
+  // used in place (staged:false → never deleted).
+  async function stageOutboundMedia({ path: p, url }) {
+    if (p) {
+      const abs = path.resolve(String(p));
+      if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error(`file not found: ${abs}`);
+      if (fs.statSync(abs).size > media.maxBytes) throw new Error('file exceeds MEDIA_MAX_BYTES');
+      return { path: abs, mime: mimeFromName(abs), filename: path.basename(abs), staged: false };
+    }
+    if (url) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 30000);
+      let r;
+      try { r = await fetch(String(url), { signal: ctrl.signal }); }
+      catch (e) { throw new Error(`download failed: ${e.message}`); }
+      finally { clearTimeout(timer); }
+      if (!r.ok) throw new Error(`download ${r.status}`);
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.length > media.maxBytes) throw new Error('download exceeds MEDIA_MAX_BYTES');
+      const mime = (r.headers.get('content-type') || '').split(';')[0] || 'application/octet-stream';
+      const base = (String(url).split('/').pop() || 'file').split('?')[0] || 'file';
+      const ext = path.extname(base) || extFromMime(mime);
+      fs.mkdirSync(OUTBOUND_MEDIA_DIR, { recursive: true });
+      const file = path.join(OUTBOUND_MEDIA_DIR, `${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+      fs.writeFileSync(file, buf);
+      return { path: file, mime, filename: base.includes('.') ? base : base + ext, staged: true };
+    }
+    throw new Error('media needs a path or url');
+  }
+
+  // Delete a staged (URL-downloaded) file once it's no longer needed. Disk-path
+  // originals (outside OUTBOUND_MEDIA_DIR) are left alone.
+  function cleanupStaged(mediaPath) {
+    if (mediaPath && path.resolve(mediaPath).startsWith(OUTBOUND_MEDIA_DIR)) {
+      fs.promises.unlink(mediaPath).catch(() => {});
+    }
+  }
+
+  // Turn claimed outbound rows into the wire payload for the extension. Media
+  // rows are read from disk and base64-inlined here (kept out of the DB/SSE until
+  // send time). A missing file fails the send instead of delivering it broken.
+  function hydrateSends(rows) {
+    const out = [];
+    for (const r of rows) {
+      if (r.kind === 'media') {
+        try {
+          const dataB64 = fs.readFileSync(r.mediaPath).toString('base64');
+          out.push({ id: r.id, chatId: r.chatId, kind: 'media', mime: r.mime, filename: r.filename, caption: r.caption, quotedMsgId: r.quotedMsgId, dataB64 });
+        } catch (e) {
+          markSendResult(r.id, { ok: false, error: `media file missing: ${e.message}` });
+        }
+      } else {
+        out.push({ id: r.id, chatId: r.chatId, kind: 'text', text: r.text, quotedMsgId: r.quotedMsgId });
+      }
+    }
+    return out;
+  }
 
   // In extension mode the WhatsApp connection lives in the browser tab, so the
   // service can't observe it directly. The extension reports the tab's stream
@@ -62,6 +154,18 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
       setTimeout(() => { if (backfillWaiters.delete(reqId)) resolve(null); }, BACKFILL_WAIT_MS);
       pushToClient({ backfills: [{ reqId, chatId, since, max }] });
     });
+  }
+
+  // On-demand media fetch: ask the tab to download a past message's media now
+  // (live ingest and backfill don't fetch media for old messages). The tab
+  // re-downloads via WPP.chat.downloadMedia and POSTs it to /media with
+  // store:true, so processMedia persists it regardless of STORE_MEDIA. We then
+  // poll the row until the file lands (or time out).
+  let mediaFetchSeq = 0;
+  function requestMediaFetch(chatId, msgId) {
+    if (mode !== 'extension' || !sseClients.size) return false;
+    pushToClient({ mediaFetches: [{ reqId: ++mediaFetchSeq, chatId, msgId }] });
+    return true;
   }
 
   // Resolve a name/JID → a single chat target, or report ambiguity. Alias wins
@@ -138,7 +242,13 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
     const conn = mode === 'extension'
       ? { connected: extStatus.state === 'connected', hasQR: false, extension: extStatus }
       : status();
-    res.json({ ok: true, mode, ...conn, sendEnabled, ...stats() });
+    res.json({
+      ok: true, mode, ...conn, sendEnabled,
+      media: { transcribe: media.transcribe, ocr: media.ocr, store: media.store, download: media.download },
+      summary: { provider: summaryProvider() },
+      watchlist: { keywords: listKeywords().length, channels: alertChannels() },
+      ...stats(),
+    });
   });
 
   // The extension posts the WhatsApp Web tab's connection state here.
@@ -205,6 +315,65 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
     res.json(searchMessages(String(q), { limit }));
   });
 
+  // ── Digest: unread chats grouped with their recent messages ─────────────────
+  // Structured by default (the caller — e.g. Claude — summarizes). With
+  // ?summarize=true the bridge runs SUMMARY_PROVIDER and returns prose too.
+  app.get('/digest', async (req, res) => {
+    const chatLimit = Math.min(parseInt(req.query.limit ?? '30', 10), 100);
+    const maxPerChat = Math.min(parseInt(req.query.maxPerChat ?? '15', 10), 50);
+    const chats = getUnreadDigest({ chatLimit, maxPerChat });
+    const out = { generatedAt: Date.now(), totalUnreadChats: chats.length, chats };
+
+    if (req.query.summarize === 'true') {
+      if (!summaryEnabled()) {
+        out.summary = null;
+        out.summaryError = 'SUMMARY_PROVIDER is off; set it (groq|openai|claude) or summarize the structured data yourself.';
+      } else if (chats.length === 0) {
+        out.summary = 'Nenhuma conversa não lida.';
+      } else {
+        try {
+          out.summary = await summarize({
+            system:
+              'Você resume conversas de WhatsApp não lidas para o dono da conta. ' +
+              'Para cada conversa, escreva 1–2 linhas com o essencial e destaque o que pede ação ou resposta. ' +
+              'Seja conciso e objetivo, em português. Use o nome do contato/grupo como título.',
+            content: chats.map((c) => {
+              const who = c.name || c.jid;
+              const lines = c.messages.map((m) => `${m.fromMe ? 'eu' : (m.senderName || 'eles')}: ${m.body}`).join('\n');
+              return `### ${who} (${c.unread} não lida(s))\n${lines}`;
+            }).join('\n\n'),
+          });
+        } catch (e) {
+          out.summary = null;
+          out.summaryError = String(e.message ?? e);
+        }
+      }
+    }
+    res.json(out);
+  });
+
+  // ── Pending: chats waiting on a reply from us for more than `hours` ─────────
+  app.get('/pending', (req, res) => {
+    const hours = Number(req.query.hours ?? '3');
+    const limit = Math.min(parseInt(req.query.limit ?? '50', 10), 200);
+    const includeGroups = req.query.groups !== 'false';
+    res.json({ hours, pending: getPendingReplies({ hours, limit, includeGroups }) });
+  });
+
+  // ── Alerts: recent keyword-watchlist hits ───────────────────────────────────
+  app.get('/alerts', (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit ?? '30', 10), 200);
+    res.json({ keywords: listKeywords(), channels: alertChannels(), alerts: listAlerts({ limit }) });
+  });
+
+  // ── Mentions: messages that @-mentioned the account owner (groups) ──────────
+  app.get('/mentions', (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit ?? '30', 10), 200);
+    let since = req.query.since ? Number(req.query.since) : undefined;
+    if (since === undefined && req.query.days) since = Date.now() - Number(req.query.days) * 86400000;
+    res.json({ mentions: getMentions({ limit, since }) });
+  });
+
   app.get('/send/whitelist', (req, res) => {
     res.json({ enabled: sendEnabled, allowed: listAllowed() });
   });
@@ -258,6 +427,16 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
     res.json({ ok: true, removed: removeAlias(req.params.alias) });
   });
 
+  // Send a message for an internal purpose (keyword alerts). Same security
+  // boundary as the public send route: needs ENABLE_SEND and a whitelisted
+  // target — otherwise the alert's WhatsApp channel is silently skipped.
+  async function deliverWhatsApp(jid, text) {
+    if (!sendEnabled || !isAllowed(jid)) return;
+    if (mode === 'baileys') { await sendText(jid, text); return; }
+    enqueueSend({ chatId: jid, text });
+    if (sseClients.size) pushSends(claimPending({ limit: 50 }));
+  }
+
   // ── Ingest: the extension pushes observed messages/contacts here ────────────
   // Body: { messages?: [...], contacts?: [...] }. Each message uses the same
   // normalized shape store.saveMessage() expects (see skill/whatsapp-read).
@@ -278,6 +457,7 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
         fromMe: !!m.fromMe,
         type: m.type ?? null,
         chatName: m.chatName ?? null,
+        mentionsMe: !!m.mentionsMe,
       });
       savedMsgs++;
     }
@@ -316,7 +496,95 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
       updateChatName(String(c.id), String(c.name));
       named++;
     }
+    // Keyword watchlist: scan the freshly ingested inbound messages and fire
+    // alerts. Fire-and-forget so ingest stays fast; processAlerts is best-effort.
+    processAlerts(messages, { sendWhatsApp: deliverWhatsApp }).catch(() => {});
+
     res.json({ ok: true, messages: savedMsgs, contacts: savedContacts, deleted, edited, named });
+  });
+
+  // ── Media: receive raw bytes, persist (per STORE_MEDIA) + transcribe/OCR ────
+  // The extension downloads a message's media (WPP.chat.downloadMedia) and POSTs
+  // it here base64-encoded. Processing (transcription / OCR) can take seconds, so
+  // we ack immediately and run it in the background through a serial queue (keeps
+  // us from firing dozens of parallel API calls and tripping rate limits).
+  let mediaChain = Promise.resolve();
+  function enqueueMedia(job) {
+    mediaChain = mediaChain.then(job, job); // run next regardless of prior outcome
+    return mediaChain;
+  }
+
+  app.post('/media', (req, res) => {
+    const { id, type, mime, filename, dataB64, store } = req.body ?? {};
+    if (!id || !dataB64) return res.status(400).json({ error: 'id and dataB64 are required' });
+    if (!getMessageById(id)) {
+      // The message must be ingested first (we fold text into its body). The
+      // extension flushes ingest before media, but guard anyway.
+      return res.status(409).json({ error: 'message not found; ingest it before posting media', id });
+    }
+    let buffer;
+    try {
+      buffer = Buffer.from(String(dataB64), 'base64');
+    } catch (_) {
+      return res.status(400).json({ error: 'dataB64 is not valid base64' });
+    }
+    if (buffer.length > media.maxBytes) {
+      return res.status(413).json({ error: `media exceeds MEDIA_MAX_BYTES (${media.maxBytes})`, size: buffer.length });
+    }
+    enqueueMedia(() => processMedia({ id: String(id), type, buffer, mime, filename, forceStore: !!store }));
+    res.status(202).json({ ok: true, queued: true, id });
+  });
+
+  // Serve a stored media file (feature: download a document/audio/image that
+  // arrived). Only files persisted under data/media/ per STORE_MEDIA are served.
+  app.get('/chats/:id/messages/:msgId/media', (req, res) => {
+    const row = getMessageById(req.params.msgId);
+    if (!row || row.chatId !== req.params.id) return res.status(404).json({ error: 'message not found in this chat' });
+    const abs = mediaFileAbsPath(row.mediaPath);
+    if (!abs) return res.status(404).json({ error: 'no stored media for this message (check STORE_MEDIA)' });
+    res.type(row.mediaMime || 'application/octet-stream');
+    res.set('Content-Disposition', `inline; filename="${path.basename(abs)}"`);
+    fs.createReadStream(abs).pipe(res);
+  });
+
+  // On-demand: re-download a past message's media from WhatsApp and store it.
+  // Looks the chat up from the message id, asks the tab to fetch, then waits for
+  // the file to land. Use this for media received while STORE_MEDIA was off.
+  app.post('/messages/:msgId/fetch-media', async (req, res) => {
+    if (mode !== 'extension') return res.status(400).json({ error: 'on-demand media fetch is only available in extension mode' });
+    const row = getMessageById(req.params.msgId);
+    if (!row) return res.status(404).json({ error: 'message not found' });
+    const url = `/messages/${encodeURIComponent(row.id)}/media`;
+    if (mediaFileAbsPath(row.mediaPath)) {
+      return res.json({ ok: true, alreadyStored: true, msgId: row.id, mime: row.mediaMime, status: row.mediaStatus, url });
+    }
+    if (!requestMediaFetch(row.chatId, row.id)) {
+      return res.status(503).json({ error: 'no WhatsApp Web tab connected; open the tab and retry' });
+    }
+    const deadline = Date.now() + MEDIA_FETCH_WAIT_MS;
+    while (Date.now() < deadline) {
+      await sleep(SEND_POLL_MS);
+      const r = getMessageById(row.id);
+      if (mediaFileAbsPath(r?.mediaPath)) {
+        return res.json({ ok: true, msgId: r.id, mime: r.mediaMime, status: r.mediaStatus, url });
+      }
+      if (r?.mediaStatus === 'error') return res.status(502).json({ error: 'media processing failed', msgId: r.id });
+    }
+    return res.status(202).json({
+      ok: true, pending: true, msgId: row.id,
+      note: 'fetch requested but media not ready — it may have expired on WhatsApp, or the tab is offline. Open/refresh the WhatsApp Web tab and retry.',
+    });
+  });
+
+  // Serve a stored media file by message id alone (chat resolved from the row).
+  app.get('/messages/:msgId/media', (req, res) => {
+    const row = getMessageById(req.params.msgId);
+    if (!row) return res.status(404).json({ error: 'message not found' });
+    const abs = mediaFileAbsPath(row.mediaPath);
+    if (!abs) return res.status(404).json({ error: 'no stored media for this message; POST /messages/:msgId/fetch-media first' });
+    res.type(row.mediaMime || 'application/octet-stream');
+    res.set('Content-Disposition', `inline; filename="${path.basename(abs)}"`);
+    fs.createReadStream(abs).pipe(res);
   });
 
   // ── Outbound queue (extension mode): extension drains pending sends ─────────
@@ -339,21 +607,24 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
     sseClients.add(res);
     // Catch-up: deliver anything queued while no client was connected, or since
     // a reconnect.
-    writeSends(res, claimPending({ limit: 100 }));
+    writeSends(res, hydrateSends(claimPending({ limit: 100 })));
     const heartbeat = setInterval(() => res.write(': ping\n\n'), 25000);
     req.on('close', () => { clearInterval(heartbeat); sseClients.delete(res); });
   });
 
   app.get('/outbound', (req, res) => {
     const limit = Math.min(parseInt(req.query.limit ?? '20', 10), 100);
-    res.json({ sends: claimPending({ limit }) });
+    res.json({ sends: hydrateSends(claimPending({ limit })) });
   });
 
   app.post('/outbound/:id/result', (req, res) => {
     const id = Number(req.params.id);
     const { ok, error, waMsgId } = req.body ?? {};
-    if (!getSend(id)) return res.status(404).json({ error: 'unknown send id' });
+    const row = getSend(id);
+    if (!row) return res.status(404).json({ error: 'unknown send id' });
     markSendResult(id, { ok: !!ok, error, waMsgId });
+    // Send finished (here or after the route's wait timed out) — drop staged media.
+    if (row.kind === 'media') cleanupStaged(row.mediaPath);
     res.json({ ok: true });
   });
 
@@ -406,29 +677,57 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
         chatId: req.params.id,
       });
     }
-    const text = req.body?.text;
-    if (!text || typeof text !== 'string') return res.status(400).json({ error: 'body.text required' });
+    // Body: { text } (plain), { text, quotedMsgId } (reply), or
+    // { media: { path | url }, caption?, quotedMsgId? } (image/doc/etc).
+    const { text, media: mediaSpec, caption, quotedMsgId } = req.body ?? {};
+    const chatId = req.params.id;
+
+    let enqArgs;
+    let staged = null;
+    if (mediaSpec && (mediaSpec.path || mediaSpec.url)) {
+      try {
+        staged = await stageOutboundMedia(mediaSpec);
+      } catch (e) {
+        return res.status(400).json({ error: `media: ${e.message}` });
+      }
+      enqArgs = {
+        chatId, kind: 'media', mediaPath: staged.path, mime: staged.mime,
+        filename: staged.filename, caption: caption ?? text ?? null, quotedMsgId: quotedMsgId ?? null,
+      };
+    } else {
+      if (!text || typeof text !== 'string') return res.status(400).json({ error: 'body.text or body.media required' });
+      enqArgs = { chatId, text, kind: 'text', quotedMsgId: quotedMsgId ?? null };
+    }
 
     if (mode === 'baileys') {
       try {
-        await sendText(req.params.id, text);
+        if (enqArgs.kind === 'media') {
+          const buffer = fs.readFileSync(staged.path);
+          await sendMedia(chatId, { buffer, mime: staged.mime, filename: staged.filename, caption: enqArgs.caption });
+        } else {
+          await sendText(chatId, text); // note: quoting isn't supported in baileys mode
+        }
+        cleanupStaged(staged?.path);
         return res.json({ ok: true });
       } catch (err) {
+        cleanupStaged(staged?.path);
         return res.status(500).json({ error: String(err.message ?? err) });
       }
     }
 
     // extension mode: enqueue, push to the connected tab via SSE, then wait
     // briefly for it to confirm.
-    const id = enqueueSend({ chatId: req.params.id, text });
-    if (sseClients.size) pushSends(claimPending({ limit: 50 }));
+    const id = enqueueSend(enqArgs);
+    if (sseClients.size) pushSends(hydrateSends(claimPending({ limit: 50 })));
     const deadline = Date.now() + SEND_WAIT_MS;
     while (Date.now() < deadline) {
       await sleep(SEND_POLL_MS);
       const row = getSend(id);
-      if (row?.status === 'sent') return res.json({ ok: true, id, waMsgId: row.waMsgId });
-      if (row?.status === 'error') return res.status(502).json({ error: row.error || 'send failed', id });
+      if (row?.status === 'sent') { cleanupStaged(staged?.staged ? staged.path : null); return res.json({ ok: true, id, waMsgId: row.waMsgId }); }
+      if (row?.status === 'error') { cleanupStaged(staged?.staged ? staged.path : null); return res.status(502).json({ error: row.error || 'send failed', id }); }
     }
+    // Timed out: keep staged media so the poll backstop can still deliver it;
+    // the /result handler cleans it up when the tab finally confirms.
     res.status(202).json({
       ok: true, queued: true, pending: true, id,
       note: 'queued; the WhatsApp Web tab did not confirm in time. Ensure the extension/tab is open.',

@@ -66,6 +66,8 @@
     } else if (d.kind === 'chatMeta') {
       if (Array.isArray(d.chatNames)) ingestBuffer.chatNames.push(...d.chatNames);
       scheduleFlush();
+    } else if (d.kind === 'media') {
+      sendMedia(d); // separate from the ingest batch (bytes can be large)
     } else if (d.kind === 'status') {
       reportStatus(d.state);
     } else if (d.kind === 'sendResult') {
@@ -76,6 +78,34 @@
       if (!readyLogged) { console.log('[wab] inject ready'); readyLogged = true; }
     }
   });
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Upload one media file to /media. Retries once on 409 (message not ingested
+  // yet — the ingest flush and this download race; ingest usually wins).
+  async function sendMedia(d) {
+    const body = { id: d.id, type: d.type, mime: d.mime, filename: d.filename, dataB64: d.dataB64, store: d.store };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await api('/media', { method: 'POST', body });
+        return;
+      } catch (e) {
+        if (attempt === 0 && String(e.message).includes('409')) { await sleep(500); continue; }
+        console.warn('[wab] media upload failed', e.message);
+        return;
+      }
+    }
+  }
+
+  // Ask the service which media types to download (audio/image/document), so a
+  // background tab doesn't waste bandwidth downloading media nobody processes.
+  async function refreshMediaConfig() {
+    try {
+      const h = await api('/health');
+      const download = Array.isArray(h?.media?.download) ? h.media.download : [];
+      window.postMessage({ [TAG]: true, kind: 'mediaConfig', download }, '*');
+    } catch (_) { /* bridge offline; will refresh on next stream open */ }
+  }
 
   // Connection state is small and time-sensitive — send it straight through
   // rather than batching it with ingest.
@@ -126,7 +156,9 @@
 
   // ── Outbound: SSE push (primary) + slow poll (backstop) ─────────────────────
   function dispatchSend(send) {
-    window.postMessage({ [TAG]: true, kind: 'sendCommand', id: send.id, chatId: send.chatId, text: send.text }, '*');
+    // Forward the whole send (text or media: kind, mime, filename, caption,
+    // quotedMsgId, dataB64) — inject.js decides how to send it.
+    window.postMessage({ [TAG]: true, kind: 'sendCommand', ...send }, '*');
   }
 
   // Backfill commands ride the same SSE stream; hand them to inject.js (MAIN
@@ -136,6 +168,11 @@
       [TAG]: true, kind: 'backfillCommand',
       reqId: cmd.reqId, chatId: cmd.chatId, since: cmd.since, max: cmd.max,
     }, '*');
+  }
+
+  // On-demand media fetch command → hand to inject.js (MAIN world).
+  function dispatchMediaFetch(cmd) {
+    window.postMessage({ [TAG]: true, kind: 'mediaFetchCommand', reqId: cmd.reqId, chatId: cmd.chatId, msgId: cmd.msgId }, '*');
   }
 
   async function reportBackfill({ reqId, ingested }) {
@@ -158,12 +195,14 @@
       // drops and re-opens this stream) loses it. Ask inject.js to re-report the
       // current state so /health doesn't go stale while ingest keeps working.
       window.postMessage({ [TAG]: true, kind: 'requestStatus' }, '*');
+      refreshMediaConfig(); // re-learn which media types to download
     };
     es.onmessage = (ev) => {
       try {
         const d = JSON.parse(ev.data);
         if (d?.sends?.length) for (const s of d.sends) dispatchSend(s);
         if (d?.backfills?.length) for (const b of d.backfills) dispatchBackfill(b);
+        if (d?.mediaFetches?.length) for (const m of d.mediaFetches) dispatchMediaFetch(m);
       } catch (_) { /* ignore non-JSON keepalive */ }
     };
     es.onerror = () => { /* EventSource reconnects on its own; server re-sends pending on connect */ };
@@ -192,6 +231,7 @@
       console.warn('[wab] no API token set — open the extension options and paste the token from ~/.whatsapp-bridge/config.json');
     }
     connectStream();
+    refreshMediaConfig();
     setInterval(flush, BACKSTOP_FLUSH_MS);
     setInterval(pollOutbound, BACKSTOP_POLL_MS);
     console.log('[wab] bridge link active ->', cfg.baseUrl);
