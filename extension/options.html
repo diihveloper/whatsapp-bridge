@@ -1,33 +1,110 @@
 <!doctype html>
-<html lang="en">
+<html lang="pt-br">
 <head>
   <meta charset="utf-8" />
   <title>WhatsApp Bridge Feeder — Settings</title>
   <style>
-    body { font: 14px/1.5 system-ui, sans-serif; max-width: 520px; margin: 2rem auto; padding: 0 1rem; color: #111; }
-    h1 { font-size: 1.1rem; }
-    label { display: block; margin: 1rem 0 .25rem; font-weight: 600; }
-    input { width: 100%; padding: .5rem; box-sizing: border-box; font-family: monospace; }
-    button { margin-top: 1.25rem; padding: .5rem 1rem; cursor: pointer; }
-    .hint { color: #666; font-size: .85rem; }
-    #status { margin-left: .75rem; color: #137333; }
-    code { background: #f1f1f1; padding: 1px 4px; border-radius: 3px; }
+    :root { --bg:#f7f7f8; --card:#fff; --line:#e3e3e6; --muted:#666; --green:#137333; --red:#c5221f; --accent:#1a73e8; }
+    * { box-sizing: border-box; }
+    body { font: 14px/1.5 system-ui, sans-serif; max-width: 640px; margin: 1.5rem auto; padding: 0 1rem; color:#111; background:var(--bg); }
+    h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+    h2 { font-size: 1rem; margin: 0 0 .75rem; }
+    section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.1rem; margin: 1rem 0; }
+    label { display:block; margin:.6rem 0 .2rem; font-weight:600; }
+    input { width:100%; padding:.5rem; border:1px solid var(--line); border-radius:6px; font-family:monospace; }
+    .row { display:flex; gap:.5rem; align-items:flex-end; }
+    .row > * { flex:1; }
+    .row > button { flex:0 0 auto; }
+    button { padding:.5rem .9rem; cursor:pointer; border:1px solid var(--line); border-radius:6px; background:#fff; }
+    button.primary { background: var(--accent); color:#fff; border-color: var(--accent); }
+    button.tiny { padding:.2rem .5rem; font-size:.8rem; }
+    button.danger { color: var(--red); }
+    .hint { color: var(--muted); font-size:.85rem; }
+    .status { margin-left:.5rem; font-size:.85rem; }
+    .ok { color: var(--green); } .err { color: var(--red); }
+    code { background:#f1f1f1; padding:1px 4px; border-radius:3px; }
+    ul.items { list-style:none; padding:0; margin:.5rem 0 0; }
+    ul.items li { display:flex; gap:.5rem; align-items:center; justify-content:space-between; padding:.35rem .5rem; border:1px solid var(--line); border-radius:6px; margin-bottom:.35rem; font-family:monospace; font-size:.85rem; }
+    ul.items li .meta { color: var(--muted); font-family: system-ui; }
+    .results { border:1px solid var(--line); border-radius:6px; margin-top:.35rem; max-height:180px; overflow:auto; }
+    .results div { padding:.4rem .55rem; cursor:pointer; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:.5rem; }
+    .results div:last-child { border-bottom:0; }
+    .results div:hover { background:#f1f6ff; }
+    .results .jid { color: var(--muted); font-family: monospace; font-size:.8rem; }
+    .badge { display:inline-block; padding:.1rem .5rem; border-radius:999px; font-size:.78rem; font-weight:600; }
+    .badge.on { background:#e6f4ea; color:var(--green); } .badge.off { background:#fce8e6; color:var(--red); }
+    dl.health { display:grid; grid-template-columns:auto 1fr; gap:.2rem .75rem; margin:.5rem 0 0; }
+    dl.health dt { color:var(--muted); } dl.health dd { margin:0; font-family:monospace; }
   </style>
 </head>
 <body>
   <h1>WhatsApp Bridge Feeder</h1>
-  <p class="hint">This extension watches the open WhatsApp Web tab and feeds your local
+  <p class="hint">Watches the open WhatsApp Web tab and feeds your local
     <code>whatsapp-bridge</code> service. Keep a WhatsApp Web tab open for it to work.</p>
 
-  <label for="baseUrl">Service URL</label>
-  <input id="baseUrl" type="text" placeholder="http://127.0.0.1:4477" />
+  <!-- ── Connection / config ───────────────────────────────────────────────── -->
+  <section>
+    <h2>Connection</h2>
+    <label for="baseUrl">Service URL</label>
+    <input id="baseUrl" type="text" placeholder="http://127.0.0.1:4477" />
+    <label for="token">API token</label>
+    <input id="token" type="text" placeholder="paste apiToken from ~/.whatsapp-bridge/config.json" />
+    <p class="hint">Found in <code>~/.whatsapp-bridge/config.json</code> under <code>apiToken</code>.</p>
+    <button id="save" class="primary">Save</button>
+    <button id="refresh">Refresh status</button>
+    <span id="saveStatus" class="status"></span>
+  </section>
 
-  <label for="token">API token</label>
-  <input id="token" type="text" placeholder="paste apiToken from ~/.whatsapp-bridge/config.json" />
-  <p class="hint">Found in <code>~/.whatsapp-bridge/config.json</code> under <code>apiToken</code>.</p>
+  <!-- ── Live status ───────────────────────────────────────────────────────── -->
+  <section>
+    <h2>Status</h2>
+    <div id="health"><span class="hint">Save your token, then refresh.</span></div>
+  </section>
 
-  <button id="save">Save</button>
-  <span id="status"></span>
+  <!-- ── Aliases (read/write) ──────────────────────────────────────────────── -->
+  <section>
+    <h2>Contact aliases</h2>
+    <p class="hint">A convenience map of <code>name → JID</code> so the assistant resolves people by name. Not a security control.</p>
+    <label for="aliasName">Alias</label>
+    <input id="aliasName" type="text" placeholder="e.g. fulano" />
+    <label for="aliasJid">JID (or phone number)</label>
+    <div class="row">
+      <input id="aliasJid" type="text" placeholder="5511999999999@s.whatsapp.net" />
+      <button id="aliasAdd" class="primary">Add</button>
+    </div>
+    <label for="aliasSearch">Find a contact to fill the JID</label>
+    <input id="aliasSearch" type="text" placeholder="type a name…" />
+    <div id="aliasSearchResults" class="results" hidden></div>
+    <span id="aliasStatus" class="status"></span>
+    <ul id="aliasList" class="items"></ul>
+  </section>
+
+  <!-- ── Whitelist (read-only) ─────────────────────────────────────────────── -->
+  <section>
+    <h2>Send whitelist <span id="sendBadge" class="badge off">sending off</span></h2>
+    <p class="hint"><strong>Read-only here by design.</strong> The whitelist is a security boundary, so it must be
+      edited by you — run <code>npm run wl</code> or edit <code>send_whitelist.txt</code> in the project root
+      (the service reloads automatically). Use the search below to find and copy the exact JID.</p>
+    <label for="wlSearch">Find a chat/contact to copy its JID</label>
+    <input id="wlSearch" type="text" placeholder="type a name…" />
+    <div id="wlSearchResults" class="results" hidden></div>
+    <span id="wlStatus" class="status"></span>
+    <ul id="wlList" class="items"></ul>
+  </section>
+
+  <!-- ── Backfill ──────────────────────────────────────────────────────────── -->
+  <section>
+    <h2>Backfill history</h2>
+    <p class="hint">Re-fetch a chat's history into the database (e.g. before summarizing a conversation that arrived
+      while the tab/service were down). Needs the WhatsApp Web tab open.</p>
+    <label for="bfChat">Chat</label>
+    <input id="bfChat" type="text" placeholder="search a chat or paste a JID…" />
+    <div id="bfSearchResults" class="results" hidden></div>
+    <label for="bfSince">Since (leave empty = as far back as possible)</label>
+    <input id="bfSince" type="date" />
+    <button id="bfRun" class="primary">Backfill</button>
+    <span id="bfStatus" class="status"></span>
+  </section>
 
   <script src="options.js"></script>
 </body>

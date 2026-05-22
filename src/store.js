@@ -208,11 +208,14 @@ export function getMessages(chatId, { limit = 50, since } = {}) {
   }
   params.push(limit);
   return db.prepare(`
-    SELECT id, chat_id AS chatId, sender, body, timestamp, from_me AS fromMe, type,
-           deleted_at AS deletedAt, edited_at AS editedAt, original_body AS originalBody
-    FROM messages
-    WHERE chat_id = ? ${sinceClause}
-    ORDER BY timestamp DESC
+    SELECT m.id, m.chat_id AS chatId, m.sender,
+           COALESCE(ct.verified_name, ct.notify_name, ct.push_name) AS senderName,
+           m.body, m.timestamp, m.from_me AS fromMe, m.type,
+           m.deleted_at AS deletedAt, m.edited_at AS editedAt, m.original_body AS originalBody
+    FROM messages m
+    LEFT JOIN contacts ct ON ct.jid = m.sender
+    WHERE m.chat_id = ? ${sinceClause.replace('timestamp', 'm.timestamp')}
+    ORDER BY m.timestamp DESC
     LIMIT ?
   `).all(...params).reverse();
 }
@@ -342,6 +345,26 @@ export function getSend(id) {
            created_at AS createdAt, updated_at AS updatedAt
     FROM outbound WHERE id = ?
   `).get(id);
+}
+
+// Resolve a name → chat candidates (groups + named DMs). Complements
+// searchContacts (people) so the /conversation resolver can find groups too.
+export function searchChatsByName(query, { limit = 20 } = {}) {
+  const like = `%${String(query).toLowerCase()}%`;
+  return db.prepare(`
+    SELECT id AS jid, name, is_group AS isGroup, last_message_at AS lastMessageAt, unread
+    FROM chats
+    WHERE lower(COALESCE(name, '')) LIKE ?
+    ORDER BY last_message_at DESC NULLS LAST
+    LIMIT ?
+  `).all(like, limit);
+}
+
+export function getChat(jid) {
+  return db.prepare(`
+    SELECT id AS jid, name, is_group AS isGroup, last_message_at AS lastMessageAt, unread
+    FROM chats WHERE id = ?
+  `).get(jid);
 }
 
 export function getContact(jid) {

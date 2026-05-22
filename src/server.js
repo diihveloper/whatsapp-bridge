@@ -1,14 +1,14 @@
 import express from 'express';
 import {
   listChats, getMessages, searchMessages, markChatRead, stats,
-  searchContacts, getContact,
+  searchContacts, getContact, searchChatsByName, getChat,
   saveMessage, upsertContact, markDeleted, applyEdit, lastMessageTimestamp,
   updateChatName,
   enqueueSend, claimPending, markSendResult, getSend,
 } from './store.js';
 import { status, getQR, sendText } from './whatsapp.js';
 import { isAllowed, listAllowed } from './whitelist.js';
-import { resolveAlias, listAliases } from './aliases.js';
+import { resolveAlias, listAliases, addAlias, removeAlias } from './aliases.js';
 
 // How long /chats/:id/messages waits for the extension to confirm a queued send
 // before returning "still pending". With SSE push the tab usually confirms in
@@ -51,6 +51,46 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
   const backfillWaiters = new Map(); // reqId -> resolve(ingestedCount | null on timeout)
   let lastAutoBackfillAt = 0;
 
+  // Push a backfill command to the tab and resolve with the ingested count
+  // (or null if no tab / it didn't finish in time). Shared by the on-demand
+  // endpoint and the composite /conversation endpoint.
+  function runBackfill(chatId, { since = 0, max = BACKFILL_DEFAULT_MAX } = {}) {
+    if (mode !== 'extension' || !sseClients.size) return Promise.resolve(null);
+    const reqId = ++backfillSeq;
+    return new Promise((resolve) => {
+      backfillWaiters.set(reqId, resolve);
+      setTimeout(() => { if (backfillWaiters.delete(reqId)) resolve(null); }, BACKFILL_WAIT_MS);
+      pushToClient({ backfills: [{ reqId, chatId, since, max }] });
+    });
+  }
+
+  // Resolve a name/JID → a single chat target, or report ambiguity. Alias wins
+  // (explicit user intent), then people (contacts) + chats (so groups resolve).
+  function resolveTarget(q) {
+    const raw = String(q).trim();
+    if (!raw) return { found: false };
+    if (raw.includes('@')) {
+      const name = getChat(raw)?.name ?? getContact(raw)?.name ?? null;
+      return { found: true, target: { jid: raw, name, matchedVia: 'jid' } };
+    }
+    const aliasJid = resolveAlias(raw);
+    if (aliasJid) {
+      const name = getChat(aliasJid)?.name ?? getContact(aliasJid)?.name ?? raw;
+      return { found: true, target: { jid: aliasJid, name, matchedVia: 'alias' } };
+    }
+    const cand = new Map();
+    for (const c of searchContacts(raw, { limit: 10 })) {
+      cand.set(c.jid, { jid: c.jid, name: c.name, matchedVia: 'contact', isGroup: c.jid.endsWith('@g.us') ? 1 : 0, lastSeenAt: c.lastSeenAt });
+    }
+    for (const ch of searchChatsByName(raw, { limit: 10 })) {
+      if (!cand.has(ch.jid)) cand.set(ch.jid, { jid: ch.jid, name: ch.name, matchedVia: 'chat', isGroup: ch.isGroup, lastSeenAt: ch.lastMessageAt });
+    }
+    const list = [...cand.values()];
+    if (list.length === 0) return { found: false };
+    if (list.length === 1) return { found: true, target: list[0] };
+    return { found: false, ambiguous: true, candidates: list };
+  }
+
   // Auto-backfill on (re)connect: refill everything after our newest stored
   // message, so downtime gaps fill themselves. Only on the transition *into*
   // 'connected', and debounced — conn.main_ready can fire repeatedly.
@@ -73,7 +113,7 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
     if (origin && allowedOrigin.test(origin)) {
       res.set('Access-Control-Allow-Origin', origin);
       res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-      res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
       res.set('Access-Control-Max-Age', '86400');
     }
     if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -135,6 +175,29 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
     res.json({ ok: true });
   });
 
+  // ── Composite: resolve a name/JID and read the conversation in one call ─────
+  // ?name=<name|jid> [&limit=N] [&since=<ms>|&days=<n>] [&backfill=true]
+  // Collapses the resolve → (backfill) → read flow the skill used to do by hand.
+  // On ambiguity returns { found:false, ambiguous:true, candidates:[...] } so
+  // the caller can disambiguate instead of guessing.
+  app.get('/conversation', async (req, res) => {
+    const q = req.query.name ?? req.query.q;
+    if (!q) return res.status(400).json({ error: 'missing name (or q)' });
+    const r = resolveTarget(q);
+    if (!r.found) {
+      return res.json({ query: String(q), found: false, ambiguous: !!r.ambiguous, candidates: r.candidates ?? [] });
+    }
+    const limit = Math.min(parseInt(req.query.limit ?? '100', 10), 500);
+    let since = req.query.since ? Number(req.query.since) : undefined;
+    if (since === undefined && req.query.days) since = Date.now() - Number(req.query.days) * 86400000;
+
+    let backfilled = null;
+    if (req.query.backfill === 'true') backfilled = await runBackfill(r.target.jid, { since: since ?? 0 });
+
+    const messages = getMessages(r.target.jid, { limit, since });
+    res.json({ query: String(q), found: true, target: r.target, backfilled, count: messages.length, messages });
+  });
+
   app.get('/search', (req, res) => {
     const q = req.query.q;
     if (!q) return res.status(400).json({ error: 'missing q' });
@@ -177,6 +240,22 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
 
   app.get('/contacts/aliases', (req, res) => {
     res.json({ aliases: listAliases() });
+  });
+
+  // Aliases are a convenience layer, not a security boundary (that's the
+  // whitelist, which stays file-only), so the options page can manage them.
+  app.post('/contacts/aliases', (req, res) => {
+    const { alias, jid } = req.body ?? {};
+    if (!alias || !jid) return res.status(400).json({ error: 'alias and jid are required' });
+    try {
+      res.json({ ok: true, ...addAlias(alias, jid) });
+    } catch (e) {
+      res.status(400).json({ error: String(e.message ?? e) });
+    }
+  });
+
+  app.delete('/contacts/aliases/:alias', (req, res) => {
+    res.json({ ok: true, removed: removeAlias(req.params.alias) });
   });
 
   // ── Ingest: the extension pushes observed messages/contacts here ────────────
@@ -295,12 +374,7 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
       ? Math.min(Math.max(Number(req.body.max), 1), 10000)
       : BACKFILL_DEFAULT_MAX;
 
-    const reqId = ++backfillSeq;
-    const ingested = await new Promise((resolve) => {
-      backfillWaiters.set(reqId, resolve);
-      setTimeout(() => { if (backfillWaiters.delete(reqId)) resolve(null); }, BACKFILL_WAIT_MS);
-      pushToClient({ backfills: [{ reqId, chatId: req.params.id, since, max }] });
-    });
+    const ingested = await runBackfill(req.params.id, { since, max });
 
     if (ingested == null) {
       return res.status(202).json({
