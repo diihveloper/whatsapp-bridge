@@ -156,9 +156,10 @@
 
   // ── Outbound: SSE push (primary) + slow poll (backstop) ─────────────────────
   function dispatchSend(send) {
-    // Forward the whole send (text or media: kind, mime, filename, caption,
-    // quotedMsgId, dataB64) — inject.js decides how to send it.
-    window.postMessage({ [TAG]: true, kind: 'sendCommand', ...send }, '*');
+    // Forward the whole send under `send:` rather than spreading: the send
+    // payload itself has a `kind` field (`text` | `media`) which would
+    // overwrite the envelope's `kind: 'sendCommand'` and silently misroute.
+    window.postMessage({ [TAG]: true, kind: 'sendCommand', send }, '*');
   }
 
   // Backfill commands ride the same SSE stream; hand them to inject.js (MAIN

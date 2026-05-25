@@ -449,7 +449,7 @@
     if (ev.source !== window) return;
     const d = ev.data;
     if (!d || d[TAG] !== true) return;
-    if (d.kind === 'sendCommand') handleSendCommand(d);
+    if (d.kind === 'sendCommand') handleSendCommand(d.send);
     else if (d.kind === 'backfillCommand') handleBackfill(d);
     else if (d.kind === 'mediaFetchCommand') handleMediaFetch(d);
     else if (d.kind === 'requestStatus') reportCurrentStatus();
