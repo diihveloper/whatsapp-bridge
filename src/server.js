@@ -15,6 +15,7 @@ import { processMedia, mediaFileAbsPath } from './media/process.js';
 import { summarize, summaryEnabled, summaryProvider } from './ai.js';
 import { processAlerts, alertChannels } from './alerts.js';
 import { listKeywords } from './watchlist.js';
+import { getUpdateStatus, getPendingCommits, checkForUpdates } from './updates.js';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -265,8 +266,23 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys', agentPre
       media: { transcribe: media.transcribe, ocr: media.ocr, store: media.store, download: media.download },
       summary: { provider: summaryProvider() },
       watchlist: { keywords: listKeywords().length, channels: alertChannels() },
+      update: getUpdateStatus(),
       ...stats(),
     });
+  });
+
+  // ── Updates: list the commits HEAD is behind, or force a re-check. The actual
+  //    `git pull && npm install` runs from the wa CLI (which shells out locally
+  //    in update.repoPath) — keeping it out of the server avoids racing with
+  //    node's module cache while the service is live. ────────────────────────
+  app.get('/update/commits', async (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit ?? '20', 10), 200);
+    res.json({ status: getUpdateStatus(), commits: await getPendingCommits({ limit }) });
+  });
+
+  app.post('/update/check', async (req, res) => {
+    const status = await checkForUpdates();
+    res.json({ status });
   });
 
   // The extension posts the WhatsApp Web tab's connection state here.

@@ -18,11 +18,14 @@
 //   wa who <name|jid> [--json]
 //   wa send <name|jid> <text...> [--file <path|url>] [--caption "..."] [--reply <msgId>] [--prefix "..."] [--no-prefix] [--json]
 //   wa aliases [--json] | wa aliases add <name> <jid> | wa aliases rm <name>
+//   wa update [--check] [--yes] [--force] [--json]
 //
 // Config: ~/.whatsapp-bridge/config.json (or env WA_BRIDGE_URL / WA_BRIDGE_TOKEN).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import readline from 'node:readline';
+import { spawn } from 'node:child_process';
 
 // ── Config ────────────────────────────────────────────────────────────────
 function loadConfig() {
@@ -60,6 +63,30 @@ async function api(p, { method = 'GET', body } = {}) {
 }
 
 function fail(msg) { console.error('error: ' + msg); process.exit(1); }
+
+// y/N prompt for `wa update`. Default no on Enter / unknown input.
+function confirm(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (ans) => {
+      rl.close();
+      resolve(/^y(es)?$/i.test(ans.trim()));
+    });
+  });
+}
+
+// Spawn a child, stream its output, resolve with {code, stdout}. capture=true
+// also collects stdout for inspection (e.g. `git status --porcelain`). shell=true
+// is needed on Windows for `npm` (which lives as npm.cmd).
+function run(cmd, args, { cwd, capture = false, shell = false } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { cwd, shell, stdio: capture ? ['ignore', 'pipe', 'inherit'] : 'inherit' });
+    let out = '';
+    if (capture) child.stdout.on('data', (d) => { out += d.toString(); });
+    child.on('error', (e) => resolve({ code: 1, stdout: out, error: e }));
+    child.on('close', (code) => resolve({ code: code ?? 0, stdout: out }));
+  });
+}
 
 // ── Arg parsing ──────────────────────────────────────────────────────────
 function parseArgs(argv) {
@@ -178,7 +205,75 @@ const commands = {
       const w = data.watchlist;
       console.log(`watchlist: ${w.keywords} palavra(s) | canais: ${w.channels.length ? w.channels.join(', ') : 'nenhum'}`);
     }
+    if (data.update) {
+      const u = data.update;
+      if (u.available) console.log(`update: ${u.commitsBehind} new commit(s) on ${u.upstreamRef} — run "wa update"`);
+      else if (u.error) console.log(`update: check failed (${u.error})`);
+      else if (u.available === false) console.log(`update: up to date with ${u.upstreamRef}`);
+    }
     console.log(`messages: ${data.messages} | chats: ${data.chats} | contacts: ${data.contacts}`);
+  },
+
+  async update({ flags }) {
+    // Force a fresh check so we don't act on stale state from the last 6h tick.
+    const { data: chk } = await api('/update/check', { method: 'POST' });
+    const u = chk.status || {};
+
+    // --json (with or without --check) reports status + commits and exits without
+    // shelling out — confirmation makes no sense in JSON mode.
+    if (flags.json) {
+      const { data: log } = u.available ? await api('/update/commits?limit=20') : { data: { commits: [] } };
+      return console.log(JSON.stringify({ status: u, commits: log.commits || [] }, null, 2));
+    }
+
+    if (u.error) {
+      console.log(`Update check failed: ${u.error}`);
+      console.log(`(repo: ${u.repoPath || '?'} — make sure git is installed and a remote is configured)`);
+      process.exit(1);
+    }
+    if (!u.available) {
+      console.log(`Already up to date with ${u.upstreamRef} (HEAD ${u.current?.slice(0, 7)}).`);
+      return;
+    }
+
+    const { data: log } = await api('/update/commits?limit=20');
+    console.log(`${u.commitsBehind} new commit(s) on ${u.upstreamRef}:`);
+    for (const c of (log.commits || [])) {
+      const d = c.date ? c.date.slice(0, 10) : '';
+      console.log(`  ${c.hash.slice(0, 7)}  ${d}  ${c.subject}  — ${c.author}`);
+    }
+    if (flags.check) return;
+
+    if (!flags.yes) {
+      const ok = await confirm(`\nRun "git pull && npm install" in ${u.repoPath}? [y/N] `);
+      if (!ok) { console.log('Aborted.'); return; }
+    }
+
+    // Refuse to pull on a dirty tree unless --force; `git pull` would otherwise
+    // either fail or merge into uncommitted changes.
+    if (!flags.force) {
+      const dirty = await run('git', ['status', '--porcelain'], { cwd: u.repoPath, capture: true });
+      if (dirty.stdout.trim()) {
+        console.log('\nWorking tree has local changes:');
+        console.log(dirty.stdout);
+        console.log('Commit/stash them, or re-run with --force.');
+        process.exit(1);
+      }
+    }
+
+    console.log('\n→ git pull');
+    const pull = await run('git', ['pull', '--ff-only'], { cwd: u.repoPath });
+    if (pull.code !== 0) {
+      console.log('git pull failed. Resolve and re-run "wa update".');
+      process.exit(pull.code || 1);
+    }
+    console.log('\n→ npm install');
+    const install = await run('npm', ['install'], { cwd: u.repoPath, shell: true });
+    if (install.code !== 0) {
+      console.log('npm install failed. The pull succeeded; fix the install and re-run "npm install".');
+      process.exit(install.code || 1);
+    }
+    console.log('\n✓ Updated. Restart the service (stop "npm start" and run it again) to load the new code.');
   },
 
   async read({ flags, pos }) {
@@ -400,7 +495,7 @@ const [cmd, ...rest] = process.argv.slice(2);
 const handler = commands[cmd];
 if (!handler) {
   console.log('wa — whatsapp-bridge CLI\n');
-  console.log('commands: health | read | search | chats | digest | pending | alerts | mentions | export | media | who | send | aliases');
+  console.log('commands: health | read | search | chats | digest | pending | alerts | mentions | export | media | who | send | aliases | update');
   console.log('run "wa <command>" with --help-style usage shown on missing args.');
   process.exit(cmd ? 1 : 0);
 }

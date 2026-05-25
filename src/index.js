@@ -3,6 +3,7 @@ import { loadOrCreateConfig, writeRuntimeInfo, configPath } from './config.js';
 import { startWhatsApp } from './whatsapp.js';
 import { createServer } from './server.js';
 import { listAllowed, whitelistPath } from './whitelist.js';
+import { startUpdateChecker } from './updates.js';
 
 const PORT = Number(process.env.PORT ?? 4477);
 const HOST = process.env.HOST ?? '127.0.0.1';
@@ -40,4 +41,5 @@ if (mode === 'baileys') {
 const app = createServer({ apiToken: config.apiToken, sendEnabled, mode, agentPrefix });
 app.listen(PORT, HOST, () => {
   console.log(`HTTP listening on http://${HOST}:${PORT}`);
+  startUpdateChecker();
 });
