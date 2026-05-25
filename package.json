@@ -4,6 +4,9 @@
   "description": "Local WhatsApp service + Claude Code skill for reading messages",
   "type": "module",
   "private": true,
+  "bin": {
+    "wa": "./skill/whatsapp-read/wa.mjs"
+  },
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",

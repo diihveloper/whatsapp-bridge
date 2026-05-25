@@ -52,7 +52,24 @@ const EXT_BY_MIME = Object.fromEntries(Object.entries(MIME_BY_EXT).map(([e, m]) 
 const mimeFromName = (name) => MIME_BY_EXT[path.extname(name).toLowerCase()] || 'application/octet-stream';
 const extFromMime = (mime) => EXT_BY_MIME[mime] || '.bin';
 
-export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
+export function createServer({ apiToken, sendEnabled, mode = 'baileys', agentPrefix = '' }) {
+  // Prepend the agent/automation tag to outbound text/caption so the recipient
+  // can tell a message came from a script/skill rather than a human. Behavior:
+  //   override === false / ''     → no prefix for this send (escape hatch)
+  //   override === <string>       → use this prefix for this send only
+  //   override === undefined      → fall back to the server default
+  //   default (env) is empty      → no prefix
+  // A single space is always inserted between tag and message — dotenv strips
+  // trailing whitespace on unquoted values, so making the separator implicit
+  // avoids "[Agente]Hello" surprises. Users who want a different separator
+  // bake it into the prefix itself (e.g. `[Agente]:` → `[Agente]: Hello`).
+  function withAgentTag(text, override) {
+    if (typeof text !== 'string' || text.length === 0) return text;
+    if (override === false || override === '') return text;
+    const prefix = typeof override === 'string' ? override : agentPrefix;
+    if (!prefix) return text;
+    return /\s$/.test(prefix) ? prefix + text : `${prefix} ${text}`;
+  }
   const app = express();
   const media = getMediaConfig();
   // Base64-encoded media inflates ~33%, plus JSON overhead — size the /media
@@ -244,6 +261,7 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
       : status();
     res.json({
       ok: true, mode, ...conn, sendEnabled,
+      send: { enabled: sendEnabled, agentPrefix },
       media: { transcribe: media.transcribe, ocr: media.ocr, store: media.store, download: media.download },
       summary: { provider: summaryProvider() },
       watchlist: { keywords: listKeywords().length, channels: alertChannels() },
@@ -432,8 +450,9 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
   // target — otherwise the alert's WhatsApp channel is silently skipped.
   async function deliverWhatsApp(jid, text) {
     if (!sendEnabled || !isAllowed(jid)) return;
-    if (mode === 'baileys') { await sendText(jid, text); return; }
-    enqueueSend({ chatId: jid, text });
+    const body = withAgentTag(text);
+    if (mode === 'baileys') { await sendText(jid, body); return; }
+    enqueueSend({ chatId: jid, text: body });
     if (sseClients.size) pushSends(claimPending({ limit: 50 }));
   }
 
@@ -679,7 +698,9 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
     }
     // Body: { text } (plain), { text, quotedMsgId } (reply), or
     // { media: { path | url }, caption?, quotedMsgId? } (image/doc/etc).
-    const { text, media: mediaSpec, caption, quotedMsgId } = req.body ?? {};
+    // Optional `agentPrefix` overrides the server default for this one send
+    // (string = use this prefix; false = no prefix; omitted = use default).
+    const { text, media: mediaSpec, caption, quotedMsgId, agentPrefix: override } = req.body ?? {};
     const chatId = req.params.id;
 
     let enqArgs;
@@ -690,13 +711,14 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
       } catch (e) {
         return res.status(400).json({ error: `media: ${e.message}` });
       }
+      const rawCaption = caption ?? text ?? null;
       enqArgs = {
         chatId, kind: 'media', mediaPath: staged.path, mime: staged.mime,
-        filename: staged.filename, caption: caption ?? text ?? null, quotedMsgId: quotedMsgId ?? null,
+        filename: staged.filename, caption: withAgentTag(rawCaption, override), quotedMsgId: quotedMsgId ?? null,
       };
     } else {
       if (!text || typeof text !== 'string') return res.status(400).json({ error: 'body.text or body.media required' });
-      enqArgs = { chatId, text, kind: 'text', quotedMsgId: quotedMsgId ?? null };
+      enqArgs = { chatId, text: withAgentTag(text, override), kind: 'text', quotedMsgId: quotedMsgId ?? null };
     }
 
     if (mode === 'baileys') {
@@ -705,7 +727,7 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys' }) {
           const buffer = fs.readFileSync(staged.path);
           await sendMedia(chatId, { buffer, mime: staged.mime, filename: staged.filename, caption: enqArgs.caption });
         } else {
-          await sendText(chatId, text); // note: quoting isn't supported in baileys mode
+          await sendText(chatId, enqArgs.text); // note: quoting isn't supported in baileys mode
         }
         cleanupStaged(staged?.path);
         return res.json({ ok: true });

@@ -106,6 +106,32 @@ Depois do `install-skill`, inicie uma sessão nova do Claude Code e pergunte coi
 
 Se você instalou a skill com o Claude Code já aberto, feche e reabra pra ele detectar.
 
+## CLI `wa` no terminal (opcional)
+
+Dentro do projeto, você já pode rodar `npm run wa -- <comando>` (ex.: `npm run wa -- health`). Se quiser usar o comando `wa` direto, de qualquer pasta, basta rodar **uma vez**, na raiz do projeto:
+
+```bash
+npm link
+```
+
+Isso registra o `wa` como comando global no seu usuário (o `npm` cria o atalho automaticamente):
+
+- **Windows**: gera `wa.cmd` em `%APPDATA%\npm\`, que o instalador do Node já deixa no PATH.
+- **macOS/Linux**: cria um symlink em `$(npm prefix -g)/bin/wa`. Se você instalou o Node via gerenciador de versão (nvm, asdf, fnm), nenhuma permissão extra é preciso. Se for um Node de sistema (Homebrew/apt), o `npm link` pode pedir `sudo`.
+
+Depois disso, é só usar normalmente em qualquer terminal:
+
+```bash
+wa health
+wa read "Fulano" --days 7
+wa send "Fulano" "oi" --no-prefix
+wa digest
+```
+
+Pra desfazer (remover o comando global): `npm unlink -g whatsapp-bridge`.
+
+> O `wa` lê o mesmo `~/.whatsapp-bridge/config.json` que o serviço gera, então **não precisa** configurar token de novo. Você pode também sobrescrever via env (`WA_BRIDGE_URL`, `WA_BRIDGE_TOKEN`).
+
 ## Configuração
 
 Todas as opções ficam no arquivo `.env`, uma por linha no formato `CHAVE=valor`. Exemplo de um `.env` de modo extensão com envio liberado:
@@ -125,6 +151,7 @@ Opções disponíveis:
 | `HOST`              | `127.0.0.1`   | Endereço de bind. Mantenha em loopback a menos que precise expor pra LAN. |
 | `BRIDGE_MODE`       | `extension`   | Como conectar: `extension` (padrão) ou `baileys`. Veja as seções "Como rodar" acima. |
 | `ENABLE_SEND`       | `false`       | Defina `true` pra liberar `POST /chats/:id/messages`.        |
+| `SEND_AGENT_PREFIX` | *(vazio)*     | Marcador opcional prefixado às mensagens enviadas (ex.: `[Agente]`, `🤖`), pra deixar claro que veio de agente/skill/automação. Espaço é inserido automaticamente. Vazio = desligado. Cada envio pode sobrescrever com `--prefix "..."` ou `--no-prefix` no `wa send`. |
 | `BAILEYS_LOG_LEVEL` | `warn`        | Verbosidade interna do Baileys. Suba pra `info`/`debug` só quando estiver investigando problema na conexão WA. |
 | `TRANSCRIBE_PROVIDER` | `off`       | Transcrição de áudio: `off` \| `groq` \| `openai` \| `whisper-local`. Veja "Mídia" abaixo. |
 | `OCR_PROVIDER`      | `off`         | OCR/descrição de imagem: `off` \| `claude` \| `groq` \| `tesseract`. |

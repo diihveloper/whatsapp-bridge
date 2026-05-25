@@ -16,7 +16,7 @@
 //   wa export <name|jid> [--days N] [--limit N] [--out file.md] [--json]
 //   wa media <msgId> [--out file]
 //   wa who <name|jid> [--json]
-//   wa send <name|jid> <text...> [--file <path|url>] [--caption "..."] [--reply <msgId>] [--json]
+//   wa send <name|jid> <text...> [--file <path|url>] [--caption "..."] [--reply <msgId>] [--prefix "..."] [--no-prefix] [--json]
 //   wa aliases [--json] | wa aliases add <name> <jid> | wa aliases rm <name>
 //
 // Config: ~/.whatsapp-bridge/config.json (or env WA_BRIDGE_URL / WA_BRIDGE_TOKEN).
@@ -167,7 +167,8 @@ const commands = {
     if (flags.json) return console.log(JSON.stringify(data, null, 2));
     const conn = data.connected ? 'connected' : 'disconnected';
     const ext = data.extension ? ` (tab: ${data.extension.state})` : '';
-    console.log(`mode: ${data.mode} | ${conn}${ext} | sending: ${data.sendEnabled ? 'ON' : 'off'}`);
+    const tag = data.send?.agentPrefix ? ` | tag: ${JSON.stringify(data.send.agentPrefix)}` : '';
+    console.log(`mode: ${data.mode} | ${conn}${ext} | sending: ${data.sendEnabled ? 'ON' : 'off'}${tag}`);
     if (data.media) {
       const md = data.media;
       console.log(`media: transcribe=${md.transcribe} | ocr=${md.ocr} | store=${md.store}`);
@@ -306,7 +307,7 @@ const commands = {
     const name = pos.shift();
     const text = pos.join(' ').trim();
     const file = typeof flags.file === 'string' ? flags.file : null;
-    if (!name || (!text && !file)) fail('usage: wa send <name|jid> <text...> [--file <path|url>] [--caption "..."] [--reply <msgId>]');
+    if (!name || (!text && !file)) fail('usage: wa send <name|jid> <text...> [--file <path|url>] [--caption "..."] [--reply <msgId>] [--prefix "..."] [--no-prefix]');
     // resolve first so we send to the right chat (and fail loudly on ambiguity)
     const { data: r } = await api('/conversation?limit=1&name=' + encodeURIComponent(name));
     if (!r.found) {
@@ -324,6 +325,9 @@ const commands = {
       body.text = text;
     }
     if (flags.reply) body.quotedMsgId = String(flags.reply);
+    // Per-send override of SEND_AGENT_PREFIX. --no-prefix wins if both are passed.
+    if (flags['no-prefix']) body.agentPrefix = false;
+    else if (typeof flags.prefix === 'string') body.agentPrefix = flags.prefix;
     const { status, data } = await api('/chats/' + encodeURIComponent(jid) + '/messages', { method: 'POST', body });
     if (flags.json) return console.log(JSON.stringify({ jid, status, ...data }, null, 2));
     const what = file ? `file ${file}` : 'message';

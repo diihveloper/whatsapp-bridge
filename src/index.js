@@ -11,6 +11,10 @@ const sendEnabled = process.env.ENABLE_SEND === 'true';
 // Chrome extension, which feeds /ingest and drains /outbound; no Baileys device
 // (lower ban risk). 'baileys' = built-in socket; opt in explicitly.
 const mode = process.env.BRIDGE_MODE === 'baileys' ? 'baileys' : 'extension';
+// Optional prefix prepended to outbound text/caption so recipients can tell
+// the message was sent by an agent/skill/automation rather than a human. Empty
+// = off (default). Trailing space is preserved exactly as written in .env.
+const agentPrefix = process.env.SEND_AGENT_PREFIX ?? '';
 
 const config = loadOrCreateConfig();
 writeRuntimeInfo({ baseUrl: `http://${HOST}:${PORT}`, sendEnabled });
@@ -24,6 +28,7 @@ if (sendEnabled) {
   const n = listAllowed().length;
   const tail = n === 0 ? ` — sends will be rejected until you add entries to ${whitelistPath()}` : '';
   console.log(`  whitelist:   ${n} chat(s) allowed${tail}`);
+  if (agentPrefix) console.log(`  agent tag:   outbound text prefixed with ${JSON.stringify(agentPrefix)}`);
 }
 
 if (mode === 'baileys') {
@@ -32,7 +37,7 @@ if (mode === 'baileys') {
   console.log('  extension mode: waiting for the WhatsApp Web tab to push messages to /ingest');
 }
 
-const app = createServer({ apiToken: config.apiToken, sendEnabled, mode });
+const app = createServer({ apiToken: config.apiToken, sendEnabled, mode, agentPrefix });
 app.listen(PORT, HOST, () => {
   console.log(`HTTP listening on http://${HOST}:${PORT}`);
 });
