@@ -6,6 +6,7 @@ import {
   updateChatName, getMessageById,
   enqueueSend, claimPending, markSendResult, getSend,
   getUnreadDigest, getPendingReplies, listAlerts, getMentions,
+  getChatMemories, listRecentMemories,
 } from './store.js';
 import { status, getQR, sendText, sendMedia } from './whatsapp.js';
 import { isAllowed, listAllowed } from './whitelist.js';
@@ -13,6 +14,7 @@ import { resolveAlias, listAliases, addAlias, removeAlias } from './aliases.js';
 import { getMediaConfig } from './media/index.js';
 import { processMedia, mediaFileAbsPath } from './media/process.js';
 import { summarize, summaryEnabled, summaryProvider } from './ai.js';
+import { buildMemoryForChat, buildMemoryForAll, memoryConfig } from './memory.js';
 import { processAlerts, alertChannels } from './alerts.js';
 import { listKeywords } from './watchlist.js';
 import { getUpdateStatus, getPendingCommits, checkForUpdates } from './updates.js';
@@ -265,6 +267,7 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys', agentPre
       send: { enabled: sendEnabled, agentPrefix },
       media: { transcribe: media.transcribe, ocr: media.ocr, store: media.store, download: media.download },
       summary: { provider: summaryProvider() },
+      memory: memoryConfig(),
       watchlist: { keywords: listKeywords().length, channels: alertChannels() },
       update: getUpdateStatus(),
       ...stats(),
@@ -392,6 +395,56 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys', agentPre
     const limit = Math.min(parseInt(req.query.limit ?? '50', 10), 200);
     const includeGroups = req.query.groups !== 'false';
     res.json({ hours, pending: getPendingReplies({ hours, limit, includeGroups }) });
+  });
+
+  // ── Memory: per-chat daily/weekly LLM-written notes (on-demand only) ────────
+  // Build: POST /memory/build { chatId? | all:true, period:'daily'|'weekly',
+  //                             when?:ms, force?:bool, minMessages?:int }
+  // Read:  GET  /chats/:id/memory[?period=daily|weekly&limit=N]
+  //        GET  /memory[?period=...&limit=N]   (recent across all chats)
+  app.post('/memory/build', async (req, res) => {
+    const { chatId, all, period = 'daily', when, force = false, minMessages } = req.body ?? {};
+    if (period !== 'daily' && period !== 'weekly') {
+      return res.status(400).json({ error: 'period must be "daily" or "weekly"' });
+    }
+    if (!memoryConfig().enabled) {
+      return res.status(400).json({ error: 'SUMMARY_PROVIDER is off; set it (groq|openai|claude) in .env to enable memory.' });
+    }
+    const whenMs = when != null ? Number(when) : Date.now();
+    try {
+      if (all || !chatId) {
+        const out = await buildMemoryForAll({
+          period, when: whenMs, force: !!force,
+          minMessages: minMessages != null ? Number(minMessages) : undefined,
+        });
+        return res.json({ ok: true, ...out });
+      }
+      const out = await buildMemoryForChat(String(chatId), {
+        period, when: whenMs, force: !!force,
+        minMessages: minMessages != null ? Number(minMessages) : undefined,
+      });
+      return res.json({ ok: !!out.ok, ...out });
+    } catch (e) {
+      return res.status(500).json({ error: String(e.message ?? e) });
+    }
+  });
+
+  app.get('/chats/:id/memory', (req, res) => {
+    const period = req.query.period;
+    if (period && period !== 'daily' && period !== 'weekly') {
+      return res.status(400).json({ error: 'period must be "daily" or "weekly"' });
+    }
+    const limit = Math.min(parseInt(req.query.limit ?? '20', 10), 200);
+    res.json({ chatId: req.params.id, memories: getChatMemories(req.params.id, { period, limit }) });
+  });
+
+  app.get('/memory', (req, res) => {
+    const period = req.query.period;
+    if (period && period !== 'daily' && period !== 'weekly') {
+      return res.status(400).json({ error: 'period must be "daily" or "weekly"' });
+    }
+    const limit = Math.min(parseInt(req.query.limit ?? '50', 10), 200);
+    res.json({ memories: listRecentMemories({ period, limit }) });
   });
 
   // ── Alerts: recent keyword-watchlist hits ───────────────────────────────────

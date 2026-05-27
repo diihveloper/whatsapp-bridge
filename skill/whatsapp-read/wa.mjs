@@ -14,6 +14,10 @@
 //   wa alerts [--limit N] [--json]
 //   wa mentions [--limit N] [--days N] [--json]
 //   wa export <name|jid> [--days N] [--limit N] [--out file.md] [--json]
+//   wa memory show <name|jid> [--period daily|weekly] [--limit N] [--json]
+//   wa memory build <name|jid> [--period daily|weekly] [--when YYYY-MM-DD] [--force] [--json]
+//   wa memory build --all [--period daily|weekly] [--when YYYY-MM-DD] [--min N] [--force] [--json]
+//   wa memory list [--period daily|weekly] [--limit N] [--json]
 //   wa media <msgId> [--out file]
 //   wa who <name|jid> [--json]
 //   wa send <name|jid> <text...> [--file <path|url>] [--caption "..."] [--reply <msgId>] [--prefix "..."] [--no-prefix] [--json]
@@ -163,6 +167,34 @@ function buildExportMarkdown(data, t, isGroup) {
     out.push(`**[${fmtTime(m.timestamp)}] ${who}:** ${body}${m.editedAt ? ' _(editada)_' : ''}`, '');
   }
   return out.join('\n');
+}
+
+// Shared: resolve a name → target via /conversation, or exit with the same
+// "ambiguous / no match" message the read/send commands print. Returns the
+// resolved payload so callers can use `target.jid` etc.
+async function resolveOrExit(name) {
+  const { data } = await api('/conversation?limit=1&name=' + encodeURIComponent(name));
+  if (!data.found) {
+    if (data.ambiguous) {
+      console.log(`Ambíguo "${name}" — ${data.candidates.length} opções:`);
+      for (const c of data.candidates) console.log(`  • ${c.name || jidTail(c.jid)}  (${c.jid})  ${c.isGroup ? '[grupo]' : ''}`);
+      console.log('Re-rode com o JID exato.');
+    } else {
+      console.log(`Nenhuma conversa encontrada para "${name}".`);
+    }
+    process.exit(1);
+  }
+  return data;
+}
+
+function printMemoryHeader(m) {
+  const period = m.period === 'weekly' ? 'Semana' : 'Dia';
+  const startDay = new Date(m.periodStart).toISOString().slice(0, 10);
+  const range = m.period === 'weekly'
+    ? `${startDay} – ${new Date(m.periodEnd - 1).toISOString().slice(0, 10)}`
+    : startDay;
+  const who = m.chatName ? `${m.chatName}${m.isGroup ? ' [grupo]' : ''} — ` : '';
+  console.log(`── ${who}${period} ${range}  (${m.messageCount} msgs, ${m.model || '?'}, gerado ${fmtTime(m.createdAt)}) ──`);
 }
 
 function printConversation(d, { json }) {
@@ -469,6 +501,84 @@ const commands = {
     }
   },
 
+  async memory({ flags, pos }) {
+    const sub = pos.shift();
+    const period = flags.period === 'weekly' ? 'weekly' : 'daily';
+    if (!sub) fail('usage: wa memory <show|build|list> ...');
+
+    if (sub === 'list') {
+      const qs = new URLSearchParams();
+      if (flags.period) qs.set('period', period);
+      if (flags.limit) qs.set('limit', flags.limit);
+      const { data } = await api('/memory?' + qs.toString());
+      if (flags.json) return console.log(JSON.stringify(data, null, 2));
+      const ms = data.memories || [];
+      if (!ms.length) return console.log('Nenhuma memória registrada.');
+      for (const m of ms) printMemoryHeader(m);
+      return;
+    }
+
+    if (sub === 'show') {
+      const name = pos.join(' ').trim();
+      if (!name) fail('usage: wa memory show <name|jid> [--period daily|weekly] [--limit N]');
+      const r = await resolveOrExit(name);
+      const qs = new URLSearchParams();
+      if (flags.period) qs.set('period', period);
+      if (flags.limit) qs.set('limit', flags.limit);
+      const { data } = await api(`/chats/${encodeURIComponent(r.target.jid)}/memory?` + qs.toString());
+      if (flags.json) return console.log(JSON.stringify(data, null, 2));
+      const ms = data.memories || [];
+      if (!ms.length) return console.log(`Sem memórias para "${r.target.name || jidTail(r.target.jid)}". Rode "wa memory build" pra criar.`);
+      console.log(`Memórias de ${r.target.name || jidTail(r.target.jid)} (${r.target.jid}):\n`);
+      for (const m of ms) {
+        printMemoryHeader(m);
+        console.log(m.summary);
+        console.log('');
+      }
+      return;
+    }
+
+    if (sub === 'build') {
+      const body = { period };
+      if (flags.when) {
+        const ms = /^\d+$/.test(flags.when) ? Number(flags.when) : Date.parse(String(flags.when));
+        if (Number.isNaN(ms)) fail(`--when must be ISO date or ms (got "${flags.when}")`);
+        body.when = ms;
+      }
+      if (flags.force) body.force = true;
+      if (flags.min != null) body.minMessages = Number(flags.min);
+
+      if (flags.all) {
+        const { status, data } = await api('/memory/build', { method: 'POST', body: { ...body, all: true } });
+        if (flags.json) return console.log(JSON.stringify({ status, ...data }, null, 2));
+        if (status >= 400) return console.log(`Falhou (${status}): ${data.error || 'erro desconhecido'}`);
+        console.log(`Período ${data.period} ${new Date(data.periodStart).toISOString().slice(0, 10)} — ${data.eligible} elegível(eis), ${data.built} construída(s), ${data.skipped} pulada(s), ${data.failed} falha(s).`);
+        for (const r of (data.results || [])) {
+          const tag = r.ok && !r.skipped ? '✓' : r.skipped ? '·' : '✗';
+          const who = r.name || jidTail(r.chatId);
+          const note = r.error ? `falha: ${r.error}` : r.skipped ? (r.reason || 'pulada') : `${r.memory?.messageCount ?? r.messageCount} msgs`;
+          console.log(`  ${tag} ${who}  — ${note}`);
+        }
+        return;
+      }
+
+      const name = pos.join(' ').trim();
+      if (!name) fail('usage: wa memory build <name|jid> [--period daily|weekly] [--when YYYY-MM-DD] [--force]\n       wa memory build --all [--period ...] [--min N] [--force]');
+      const r = await resolveOrExit(name);
+      body.chatId = r.target.jid;
+      const { status, data } = await api('/memory/build', { method: 'POST', body });
+      if (flags.json) return console.log(JSON.stringify({ status, ...data }, null, 2));
+      if (status >= 400) return console.log(`Falhou (${status}): ${data.error || 'erro desconhecido'}`);
+      if (data.skipped) return console.log(`Pulada: ${data.reason}`);
+      const m = data.memory;
+      console.log(`✓ Memória ${m.period} ${new Date(m.periodStart).toISOString().slice(0, 10)} (${m.messageCount} mensagens) para ${r.target.name || jidTail(r.target.jid)}:\n`);
+      console.log(m.summary);
+      return;
+    }
+
+    fail(`unknown memory subcommand "${sub}" — expected show | build | list`);
+  },
+
   async aliases({ flags, pos }) {
     const sub = pos.shift();
     if (sub === 'add') {
@@ -495,7 +605,7 @@ const [cmd, ...rest] = process.argv.slice(2);
 const handler = commands[cmd];
 if (!handler) {
   console.log('wa — whatsapp-bridge CLI\n');
-  console.log('commands: health | read | search | chats | digest | pending | alerts | mentions | export | media | who | send | aliases | update');
+  console.log('commands: health | read | search | chats | digest | pending | alerts | mentions | export | media | memory | who | send | aliases | update');
   console.log('run "wa <command>" with --help-style usage shown on missing args.');
   process.exit(cmd ? 1 : 0);
 }

@@ -96,6 +96,30 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_alerts_matched
     ON alerts(matched_at DESC);
+
+  -- Per-chat daily/weekly memory: an LLM-written summary of what happened in
+  -- the given period, optionally fed back as context when building the next
+  -- one (cumulative memory, like Claude Code sessions). Generation is on-demand
+  -- via POST /memory/build — never automatic — and gated by SUMMARY_PROVIDER.
+  -- UNIQUE so rebuilding the same window overwrites instead of duplicating.
+  CREATE TABLE IF NOT EXISTS chat_memories (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id       TEXT NOT NULL,
+    period        TEXT NOT NULL,            -- 'daily' | 'weekly'
+    period_start  INTEGER NOT NULL,         -- ms, start of day/week (local)
+    period_end    INTEGER NOT NULL,         -- ms, exclusive upper bound
+    message_count INTEGER NOT NULL,
+    summary       TEXT NOT NULL,
+    model         TEXT,                     -- provider:model used
+    created_at    INTEGER NOT NULL,
+    UNIQUE(chat_id, period, period_start)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_chat_memories_chat
+    ON chat_memories(chat_id, period, period_start DESC);
+
+  CREATE INDEX IF NOT EXISTS idx_chat_memories_period
+    ON chat_memories(period, period_start DESC);
 `);
 
 // Defensive migration: messages already exists in older DBs, so add the
@@ -529,6 +553,123 @@ export function getMentions({ limit = 30, since } = {}) {
     LEFT JOIN contacts ct ON ct.jid = m.sender
     WHERE m.mentions_me = 1 ${sinceClause}
     ORDER BY m.timestamp DESC
+    LIMIT ?
+  `).all(...params);
+}
+
+// ── Per-chat memory: messages in a window, eligible chats, upsert/read ──────
+// Used by src/memory.js — the LLM orchestrator that turns these into summaries.
+// Group sender names are resolved via the contacts join so the LLM sees real
+// names instead of bare JIDs.
+export function messagesInRange(chatId, start, end, { limit = 2000 } = {}) {
+  return db.prepare(`
+    SELECT m.id, m.chat_id AS chatId, m.sender,
+           COALESCE(ct.verified_name, ct.notify_name, ct.push_name) AS senderName,
+           m.body, m.timestamp, m.from_me AS fromMe, m.type,
+           m.deleted_at AS deletedAt, m.edited_at AS editedAt, m.original_body AS originalBody
+    FROM messages m
+    LEFT JOIN contacts ct ON ct.jid = m.sender
+    WHERE m.chat_id = ? AND m.timestamp >= ? AND m.timestamp < ?
+    ORDER BY m.timestamp ASC
+    LIMIT ?
+  `).all(chatId, start, end, limit);
+}
+
+// Chats that saw at least `minMessages` messages in [start, end). Newsletters
+// and the status broadcast are excluded — they're not real conversations.
+export function listChatsWithActivity({ start, end, minMessages = 5, limit = 200 } = {}) {
+  return db.prepare(`
+    SELECT c.id AS jid, c.name, c.is_group AS isGroup,
+           COUNT(m.id) AS messageCount,
+           MAX(m.timestamp) AS lastMessageAt
+    FROM chats c
+    JOIN messages m ON m.chat_id = c.id
+    WHERE m.timestamp >= ? AND m.timestamp < ?
+      AND c.id NOT LIKE '%@newsletter' AND c.id <> 'status@broadcast'
+    GROUP BY c.id
+    HAVING COUNT(m.id) >= ?
+    ORDER BY messageCount DESC
+    LIMIT ?
+  `).all(start, end, minMessages, limit);
+}
+
+const upsertChatMemoryStmt = db.prepare(`
+  INSERT INTO chat_memories
+    (chat_id, period, period_start, period_end, message_count, summary, model, created_at)
+  VALUES
+    (@chatId, @period, @periodStart, @periodEnd, @messageCount, @summary, @model, @createdAt)
+  ON CONFLICT(chat_id, period, period_start) DO UPDATE SET
+    period_end    = excluded.period_end,
+    message_count = excluded.message_count,
+    summary       = excluded.summary,
+    model         = excluded.model,
+    created_at    = excluded.created_at
+`);
+
+export function upsertChatMemory({ chatId, period, periodStart, periodEnd, messageCount, summary, model = null }) {
+  upsertChatMemoryStmt.run({
+    chatId, period, periodStart, periodEnd, messageCount, summary, model,
+    createdAt: Date.now(),
+  });
+  return getChatMemory(chatId, period, periodStart);
+}
+
+export function getChatMemory(chatId, period, periodStart) {
+  return db.prepare(`
+    SELECT id, chat_id AS chatId, period,
+           period_start AS periodStart, period_end AS periodEnd,
+           message_count AS messageCount, summary, model, created_at AS createdAt
+    FROM chat_memories
+    WHERE chat_id = ? AND period = ? AND period_start = ?
+  `).get(chatId, period, periodStart);
+}
+
+export function getChatMemories(chatId, { period, limit = 20 } = {}) {
+  const params = [chatId];
+  let periodClause = '';
+  if (period) { periodClause = 'AND period = ?'; params.push(period); }
+  params.push(limit);
+  return db.prepare(`
+    SELECT id, chat_id AS chatId, period,
+           period_start AS periodStart, period_end AS periodEnd,
+           message_count AS messageCount, summary, model, created_at AS createdAt
+    FROM chat_memories
+    WHERE chat_id = ? ${periodClause}
+    ORDER BY period_start DESC
+    LIMIT ?
+  `).all(...params);
+}
+
+// Most recent memory for a chat+period — used as prior-context when building
+// the next one (so the LLM can carry facts/decisions forward instead of
+// re-deriving them every cycle).
+export function getLatestChatMemory(chatId, period) {
+  return db.prepare(`
+    SELECT id, chat_id AS chatId, period,
+           period_start AS periodStart, period_end AS periodEnd,
+           message_count AS messageCount, summary, model, created_at AS createdAt
+    FROM chat_memories
+    WHERE chat_id = ? AND period = ?
+    ORDER BY period_start DESC
+    LIMIT 1
+  `).get(chatId, period);
+}
+
+// Recent memories across all chats (with chat name) — for `wa memory` listing
+// and the GET /memory endpoint.
+export function listRecentMemories({ period, limit = 50 } = {}) {
+  const params = [];
+  let periodClause = '';
+  if (period) { periodClause = 'WHERE m.period = ?'; params.push(period); }
+  params.push(limit);
+  return db.prepare(`
+    SELECT m.id, m.chat_id AS chatId, c.name AS chatName, c.is_group AS isGroup,
+           m.period, m.period_start AS periodStart, m.period_end AS periodEnd,
+           m.message_count AS messageCount, m.summary, m.model, m.created_at AS createdAt
+    FROM chat_memories m
+    LEFT JOIN chats c ON c.id = m.chat_id
+    ${periodClause}
+    ORDER BY m.period_start DESC, m.created_at DESC
     LIMIT ?
   `).all(...params);
 }

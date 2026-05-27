@@ -29,6 +29,10 @@ Commands:
 | `wa mentions [--limit N] [--days N]` | Messages that @-mentioned the user (mostly groups). |
 | `wa export <name\|jid> [--days N] [--limit N] [--out file.md]` | Markdown transcript of a conversation (to stdout or a file). Feed it to the document skill for an LI-styled doc. |
 | `wa media <msgId> [--out file]` | Re-download a message's media (image/doc/audio) from WhatsApp and save it locally, so you can open/analyze the actual file. Get the `msgId` from `wa read --json`. Needs the WhatsApp Web tab open. |
+| `wa memory show <name\|jid> [--period daily\|weekly]` | Print the LLM-written daily/weekly memory notes for a chat (decisions, pending items, facts to remember). |
+| `wa memory build <name\|jid> [--period daily\|weekly] [--when YYYY-MM-DD] [--force]` | Build (or rebuild with `--force`) a memory for a chat in a period. Needs `SUMMARY_PROVIDER` set. On-demand only — there's no scheduler. |
+| `wa memory build --all [--period ...] [--min N] [--force]` | Build memories for every chat with at least N messages in the period (default from `MEMORY_MIN_MESSAGES`). Sequential. |
+| `wa memory list [--period ...] [--limit N]` | Recent memories across all chats. |
 | `wa who <name\|jid>` | Resolve a name → JID without reading messages. |
 | `wa send <name\|jid> <text...> [--file <path\|url>] [--caption "..."] [--reply <msgId>]` | Send text, a quoted reply (`--reply`), or a media file (`--file`, from disk or URL). Gated — see "Sending". |
 | `wa aliases` / `wa aliases add <name> <jid>` / `wa aliases rm <name>` | Manage name→JID aliases. |
@@ -59,6 +63,7 @@ node ~/.claude/skills/whatsapp-read/wa.mjs chats --unread
 - **"Quem está esperando resposta" / "esqueci de responder alguém":** `wa pending` (padrão > 3h sem resposta nossa). `--hours N` ajusta a janela, `--dm` ignora grupos.
 - **Alertas de palavra-chave:** `wa alerts` mostra os termos batidos (definidos pelo usuário em `watchlist.txt`). Os canais de aviso (WhatsApp/webhook) são configurados no `.env` pelo usuário — não tente configurá-los você.
 - **"Onde me marcaram":** `wa mentions` lista as mensagens em que você foi @-mencionado (principalmente em grupos).
+- **Memória por conversa (diária/semanal):** `wa memory show <nome>` mostra o que já foi escrito; `wa memory build <nome>` cria/atualiza a memória do dia atual (`--period weekly` para a semana; `--when YYYY-MM-DD` para um dia/semana passado; `--force` para reconstruir). É **sob demanda** — nada roda automático. Útil quando o usuário pede pra "lembrar do contexto" de uma conversa antiga ou pra preparar contexto antes de responder. Precisa de `SUMMARY_PROVIDER` ligado no `.env`; se estiver `off`, avise o usuário em vez de tentar habilitar.
 - **Exportar conversa pra documento:** `wa export <nome> --out conversa.md` gera um Markdown da conversa. Para um documento no padrão Loja Interativa, rode o export e depois use a skill **edicao-documentos-loja-interativa** com esse conteúdo (.docx/PDF).
 - **Analisar uma imagem/arquivo recebido:** mensagens de mídia aparecem como `🖼️`/`📎` sem o conteúdo. Para ver/analisar o arquivo de verdade, pegue o `id` da mensagem (`wa read <nome> --json`) e rode `wa media <id> --out arquivo.ext` — ele re-baixa a mídia do WhatsApp e salva localmente (precisa da aba aberta; a mídia precisa ainda existir no WhatsApp). Depois você pode ler/analisar o arquivo salvo.
 
@@ -90,6 +95,9 @@ The CLI wraps these. Use them directly only if the CLI is unavailable. Every req
 | POST | `/chats/:id/backfill` | Body `{ since?, max? }` — re-fetch history (extension mode, tab open) |
 | GET | `/search?q=<text>&limit=20` | Full-text search |
 | GET | `/digest?limit=30&summarize=true` | Unread chats + recent messages grouped. `summarize=true` adds server-side prose if `SUMMARY_PROVIDER` is set; else returns `{ summaryError }` (summarize the structured `chats` yourself). |
+| POST | `/memory/build` | Body `{ chatId?, all?, period:'daily'\|'weekly', when?, force?, minMessages? }` — build/rebuild per-chat LLM memory notes. Needs `SUMMARY_PROVIDER`. |
+| GET | `/chats/:id/memory?period=daily\|weekly&limit=N` | List stored memories for a chat. |
+| GET | `/memory?period=...&limit=N` | Recent memories across all chats. |
 | GET | `/pending?hours=3&limit=50&groups=false` | Chats waiting on the user's reply for >N hours, oldest first |
 | GET | `/alerts?limit=30` | Recent keyword-watchlist hits + active `keywords`/`channels` |
 | GET | `/mentions?limit=30&days=N` | Messages that @-mentioned the user |
