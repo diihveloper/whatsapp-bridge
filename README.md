@@ -1,6 +1,6 @@
 # whatsapp-bridge
 
-Programa que roda **no seu próprio computador**, fica conectado ao seu WhatsApp e guarda as mensagens num banco de dados local. Vem junto com uma skill do Claude Code (`whatsapp-read`) que deixa o Claude **ler, buscar e (se você liberar) enviar** mensagens pra você — por exemplo: "me faz um resumo do que rolou no grupo hoje".
+Programa que roda **no seu próprio computador**, fica conectado ao seu WhatsApp e guarda as mensagens num banco de dados local. Vem junto com uma skill do Claude Code (`whatsapp-assistant`) que deixa o Claude **ler, buscar e (se você liberar) enviar** mensagens pra você — por exemplo: "me faz um resumo do que rolou no grupo hoje".
 
 Nada é enviado para servidor externo: token, mensagens e sessão ficam todos na sua máquina.
 
@@ -319,7 +319,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:4477/health
 
 **A skill diz que não consegue alcançar o serviço** — Confirme que `npm start` está rodando e `~/.whatsapp-bridge/config.json` existe. A skill lê `baseUrl` e `apiToken` desse arquivo.
 
-**A skill não dispara** — Verifique se você rodou `npm run install-skill` e abriu uma sessão nova do Claude Code. Confirme que o arquivo `~/.claude/skills/whatsapp-read/SKILL.md` está lá.
+**A skill não dispara** — Verifique se você rodou `npm run install-skill` e abriu uma sessão nova do Claude Code. Confirme que o arquivo `~/.claude/skills/whatsapp-assistant/SKILL.md` está lá.
 
 **(Modo extensão) As mensagens não aparecem / o Claude diz que não tem nada novo** — A aba do `web.whatsapp.com` precisa estar **aberta**. Confirme no console da aba (`F12` → Console) a linha `[wab] connected to WPP, streaming...`. Lembre que o serviço só captura mensagens recebidas **enquanto** estava rodando — ele não importa o histórico antigo.
 

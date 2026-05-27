@@ -29,6 +29,6 @@ Backlog de ideias ainda não implementadas. Cada item descreve o "o quê", o "po
   - Modo `extension` (`extension/inject.js`): assinar o evento de revoke do wa-js (ex.: `WPP.on('chat.msg_revoke', ...)` — confirmar o nome exato na versão instalada) e postar pro `bridge.js` algo como `{ kind: 'revoke', id }`. O `bridge.js` manda pra um novo campo do `/ingest` (ex.: `revokes: [id]`) ou um endpoint dedicado.
   - Modo `baileys` (`src/whatsapp.js`): tratar o `protocolMessage` com `type = REVOKE` (ele carrega a `key` da mensagem revogada) e/ou o evento `messages.update`.
 - **Servidor** (`src/server.js`): aceitar os ids revogados no `/ingest` e chamar `markDeleted`.
-- **API + skill:** incluir a flag (ex.: `deleted: true`) na resposta de `/chats/:id/messages` e documentar no `skill/whatsapp-read/SKILL.md` pra o Claude poder dizer "(esta mensagem foi apagada pelo remetente)".
+- **API + skill:** incluir a flag (ex.: `deleted: true`) na resposta de `/chats/:id/messages` e documentar no `skill/whatsapp-assistant/SKILL.md` pra o Claude poder dizer "(esta mensagem foi apagada pelo remetente)".
 
 **Origem:** ideia que surgiu testando deleção — o "Oi" apagado pelo Breno permaneceu no histórico sem marcação.

@@ -527,7 +527,7 @@ export function createServer({ apiToken, sendEnabled, mode = 'baileys', agentPre
 
   // ── Ingest: the extension pushes observed messages/contacts here ────────────
   // Body: { messages?: [...], contacts?: [...] }. Each message uses the same
-  // normalized shape store.saveMessage() expects (see skill/whatsapp-read).
+  // normalized shape store.saveMessage() expects (see skill/whatsapp-assistant).
   app.post('/ingest', (req, res) => {
     const { messages = [], contacts = [], revokes = [], edits = [], chatNames = [] } = req.body ?? {};
     if (![messages, contacts, revokes, edits, chatNames].every(Array.isArray)) {

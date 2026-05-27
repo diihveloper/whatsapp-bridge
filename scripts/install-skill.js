@@ -4,9 +4,9 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SRC = path.resolve(__dirname, '..', 'skill', 'whatsapp-read');
+const SRC = path.resolve(__dirname, '..', 'skill', 'whatsapp-assistant');
 const DST_ROOT = path.join(os.homedir(), '.claude', 'skills');
-const DST = path.join(DST_ROOT, 'whatsapp-read');
+const DST = path.join(DST_ROOT, 'whatsapp-assistant');
 
 if (!fs.existsSync(SRC)) {
   console.error(`source skill folder not found at ${SRC}`);

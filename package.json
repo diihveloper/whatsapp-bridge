@@ -5,14 +5,14 @@
   "type": "module",
   "private": true,
   "bin": {
-    "wa": "./skill/whatsapp-read/wa.mjs"
+    "wa": "./skill/whatsapp-assistant/wa.mjs"
   },
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "install-skill": "node scripts/install-skill.js",
     "wl": "node scripts/whitelist.js",
-    "wa": "node skill/whatsapp-read/wa.mjs",
+    "wa": "node skill/whatsapp-assistant/wa.mjs",
     "build-extension": "node scripts/build-extension.js"
   },
   "engines": {

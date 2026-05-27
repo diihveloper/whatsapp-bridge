@@ -1,18 +1,18 @@
 ---
-name: whatsapp-read
-description: Read WhatsApp messages, list chats, and search history via the local whatsapp-bridge service. Use when the user asks about WhatsApp messages, "what did X say on WhatsApp", "any unread WhatsApp", "search WhatsApp for Y", "send a WhatsApp to X", or anything involving WhatsApp conversations.
+name: whatsapp-assistant
+description: Read, search, send, and manage WhatsApp via the local whatsapp-bridge service — reads, sends (gated), keyword alerts, @-mentions, per-chat memory, media download, and conversation export. Use when the user asks about WhatsApp messages, "what did X say on WhatsApp", "any unread WhatsApp", "search WhatsApp for Y", "send a WhatsApp to X", "lembra do que falamos com X", or anything involving WhatsApp conversations.
 ---
 
-# whatsapp-read
+# whatsapp-assistant
 
 Talks to a local service (`whatsapp-bridge`) that holds a logged-in WhatsApp session and persists incoming messages.
 
 ## Use the `wa` CLI (primary interface)
 
-A bundled CLI does the heavy lifting — it reads the config, authenticates, resolves names → JIDs, optionally backfills, and prints clean output (local times, resolved sender names, deleted/edited flags). **Prefer it over raw HTTP calls.** It lives next to this file; when the skill is installed it's at `~/.claude/skills/whatsapp-read/wa.mjs`:
+A bundled CLI does the heavy lifting — it reads the config, authenticates, resolves names → JIDs, optionally backfills, and prints clean output (local times, resolved sender names, deleted/edited flags). **Prefer it over raw HTTP calls.** It lives next to this file; when the skill is installed it's at `~/.claude/skills/whatsapp-assistant/wa.mjs`:
 
 ```bash
-node ~/.claude/skills/whatsapp-read/wa.mjs <command>
+node ~/.claude/skills/whatsapp-assistant/wa.mjs <command>
 ```
 
 Commands:
@@ -42,11 +42,11 @@ Add `--json` to any command to get the raw JSON (use it when you need exact fiel
 Examples:
 
 ```bash
-node ~/.claude/skills/whatsapp-read/wa.mjs health
-node ~/.claude/skills/whatsapp-read/wa.mjs read "fulano" --days 7
-node ~/.claude/skills/whatsapp-read/wa.mjs read "fulano" --backfill        # before summarizing, to fill gaps
-node ~/.claude/skills/whatsapp-read/wa.mjs search "boleto" --limit 10
-node ~/.claude/skills/whatsapp-read/wa.mjs chats --unread
+node ~/.claude/skills/whatsapp-assistant/wa.mjs health
+node ~/.claude/skills/whatsapp-assistant/wa.mjs read "fulano" --days 7
+node ~/.claude/skills/whatsapp-assistant/wa.mjs read "fulano" --backfill        # before summarizing, to fill gaps
+node ~/.claude/skills/whatsapp-assistant/wa.mjs search "boleto" --limit 10
+node ~/.claude/skills/whatsapp-assistant/wa.mjs chats --unread
 ```
 
 ### Reading the output
